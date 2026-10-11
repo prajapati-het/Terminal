@@ -7,6 +7,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <err.h>
+#include <ctype.h>
 
 #define POSY 100
 #define POSX 100
@@ -56,16 +57,123 @@ static void add_line(const char *s)
     line_count++;
 }
 
+
+static int quotes_balanced(const char *cmd)
+{
+    char quote = '\0';
+    int escape = 0;
+
+    while (*cmd)
+    {
+        if (escape)
+        {
+            escape = 0;
+        }
+        else if (*cmd == '\\' && quote != '\'')
+        {
+            escape = 1;
+        }
+        else if (quote)
+        {
+            if (*cmd == quote)
+                quote = '\0';
+        }
+        else if (*cmd == '\'' || *cmd == '"')
+        {
+            quote = *cmd;
+        }
+
+        cmd++;
+    }
+
+    return quote == '\0';
+}
+
+static int tokenize_command(char *cmd, char *args[MAX_ARGS])
+{
+    char *r = cmd;
+    char *w = cmd;
+    char quote;
+    int argc = 0;
+
+    while (*r)
+    {
+        while (isspace((unsigned char)*r))
+            r++;
+
+        if (!*r)
+            break;
+
+        if (argc >= MAX_ARGS - 1)
+            return -1;
+
+        args[argc++] = w;
+        quote = '\0';
+
+        while (*r)
+        {
+            if (!quote && isspace((unsigned char)*r))
+                break;
+
+            if (!quote && (*r == '\'' || *r == '"'))
+            {
+                quote = *r++;
+                continue;
+            }
+
+            if (quote && *r == quote)
+            {
+                quote = '\0';
+                r++;
+                continue;
+            }
+
+            if (*r == '\\' && quote != '\'' && r[1])
+            {
+                r++;
+                *w++ = *r++;
+                continue;
+            }
+
+            *w++ = *r++;
+        }
+
+        if (*r && isspace((unsigned char)*r))
+            r++;
+
+        *w++ = '\0';
+    }
+
+    args[argc] = NULL;
+    return argc;
+}
+
+
+
 static void draw_terminal(Window win, GC gc, const char *cmd, int len)
 {
     int visible = (HEIGHT - 20) / LINE_HEIGHT;
-    int total = line_count + 1;
-    int max_scroll = total > visible ? total - visible : 0;
+    int cmd_lines = 1;
+    int total;
+    int max_scroll;
     int start;
     int i;
+    int pos = 0;
+
+    for (i = 0; i < len; i++)
+    {
+        if (cmd[i] == '\n')
+            cmd_lines++;
+    }
+
+    total = line_count + cmd_lines;
+    max_scroll = total > visible ? total - visible : 0;
 
     if (scroll_offset > max_scroll)
         scroll_offset = max_scroll;
+
+    if (scroll_offset < 0)
+        scroll_offset = 0;
 
     start = total - visible - scroll_offset;
     if (start < 0)
@@ -84,13 +192,43 @@ static void draw_terminal(Window win, GC gc, const char *cmd, int len)
         }
         else
         {
-            XDrawString(dpy, win, gc, 10, y, "$ ", 2);
-            XDrawString(dpy, win, gc, 25, y, cmd, len);
+            int line_no = i - line_count;
+            int begin = 0;
+            int end = 0;
+            int j;
+
+            pos = 0;
+
+            for (j = 0; j < line_no; j++)
+            {
+                while (pos < len && cmd[pos] != '\n')
+                    pos++;
+
+                if (pos < len)
+                    pos++;
+            }
+
+            begin = pos;
+            end = begin;
+
+            while (end < len && cmd[end] != '\n')
+                end++;
+
+            if (line_no == 0)
+                XDrawString(dpy, win, gc, 10, y, "$ ", 2);
+            else
+                XDrawString(dpy, win, gc, 10, y, "> ", 2);
+
+            if (end > begin)
+                XDrawString(dpy, win, gc, 25, y,
+                    cmd + begin, end - begin);
         }
     }
 
     XFlush(dpy);
 }
+
+
 
 static void execute_command(char *cmd)
 {
@@ -100,24 +238,16 @@ static void execute_command(char *cmd)
     char *args[MAX_ARGS];
     char buffer[256];
     char output[MAX_LINE_LEN];
-    int argc = 0;
+    int argc;
     size_t out_len = 0;
     FILE *fp;
 
-    char *token = strtok(cmd, " \t\r\n");
-
-    while (token != NULL && argc < MAX_ARGS - 1)
-    {
-        args[argc++] = token;
-        token = strtok(NULL, " \t\r\n");
-    }
-
-    args[argc] = NULL;
+    argc = tokenize_command(cmd, args);
 
     if (argc == 0)
         return;
 
-    if (token != NULL)
+    if (argc < 0)
     {
         add_line("Too many arguments");
         return;
@@ -207,6 +337,7 @@ static void execute_command(char *cmd)
 }
 
 
+
 static void run(Window win)
 {
     XEvent ev;
@@ -257,55 +388,98 @@ static void run(Window win)
 
                 draw_terminal(win, gc, cmd, len);
                 break;
-
             case KeyPress:
             {
                 char text[32];
                 KeySym key;
                 int n;
+                int shift_enter;
 
                 n = XLookupString(&ev.xkey, text, sizeof(text),
-                    &key, NULL);
+                &key, NULL);
+
+                shift_enter =
+                (key == XK_Return || key == XK_KP_Enter) &&
+                (ev.xkey.state & ShiftMask);
 
                 if (key == XK_Return || key == XK_KP_Enter)
                 {
+                if (shift_enter || !quotes_balanced(cmd))
+                {
+                    if (len < MAX_CMD - 1)
+                    {
+                    cmd[len++] = '\n';
+                    cmd[len] = '\0';
+                    }
+                }
+                else
+                {
+                    char command[MAX_CMD];
                     char prompt[MAX_LINE_LEN];
+                    char *line;
+                    char *next;
 
                     cmd[len] = '\0';
-                    snprintf(prompt, sizeof(prompt), "$ %s", cmd);
+
+                    memcpy(command, cmd, len + 1);
+
+                    line = cmd;
+
+                    do
+                    {
+                    next = strchr(line, '\n');
+
+                    if (next)
+                        *next = '\0';
+
+                    if (line == cmd)
+                        snprintf(prompt, sizeof(prompt), "$ %s", line);
+                    else
+                        snprintf(prompt, sizeof(prompt), "> %s", line);
+
                     add_line(prompt);
 
+                    if (!next)
+                        break;
+
+                    line = next + 1;
+                    }
+                    while (1);
+
                     if (len > 0)
-                        execute_command(cmd);
+                    execute_command(command);
 
                     len = 0;
                     cmd[0] = '\0';
                     scroll_offset = 0;
                 }
+
+                }
                 else if (key == XK_BackSpace || key == XK_Delete)
                 {
-                    if (len > 0)
-                    {
-                        len--;
-                        cmd[len] = '\0';
-                    }
+                if (len > 0)
+                {
+                    len--;
+                    cmd[len] = '\0';
+                }
 
-                    scroll_offset = 0;
+                scroll_offset = 0;
                 }
                 else if (n > 0 && text[0] >= 32 && text[0] <= 126)
                 {
-                    if (len < MAX_CMD - 1)
-                    {
-                        cmd[len++] = text[0];
-                        cmd[len] = '\0';
-                    }
+                if (len < MAX_CMD - 1)
+                {
+                    cmd[len++] = text[0];
+                    cmd[len] = '\0';
+                }
 
-                    scroll_offset = 0;
+                scroll_offset = 0;
                 }
 
                 draw_terminal(win, gc, cmd, len);
                 break;
             }
+
         }
     }
 
