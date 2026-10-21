@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _POSIX_C_SOURCE 200810L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,11 +12,8 @@
 #include <X11/keysym.h>
 #include <err.h>
 #include <ctype.h>
-#include <pthread.h>
-#include <semaphore.h>
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/select.h>
+#include <glob.h>
 
 #define POSY 100
 #define POSX 100
@@ -30,115 +27,109 @@
 #define LINE_HEIGHT 20
 #define CMD_HISTORY_SIZE 1000
 #define CMD_SIZE 2048
+#define MAX_STAGES 128
 
-char cmd_history[CMD_HISTORY_SIZE][CMD_SIZE];
-int cmd_history_count = 0;
-int last_status = 0;
-int shell_running = 1;
-static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+    char *args[MAX_ARGS];
+    int argc;
+    char *input;
+    char *output;
+    char *error;
+    int append;
+    int background;
+} Stage;
+
+static char cmd_history[CMD_HISTORY_SIZE][CMD_SIZE];
+static int cmd_history_count;
+static int last_status;
+static int shell_running = 1;
 
 static Display *dpy;
 static int scr;
 static Window root;
 static Atom wm_delete_window;
-static int use_process_mode = 0;
 
 static char history[MAX_LINES][MAX_LINE_LEN];
-static int line_count = 0;
-static int scroll_offset = 0;
+static char token_storage[MAX_ARGS * 2][MAX_CMD];
+static int line_count;
+static int scroll_offset;
 
 static void add_line(const char *s)
 {
     if (line_count == MAX_LINES) {
-        memmove(history, history + 1, sizeof(history[0]) * (MAX_LINES - 1));
+        memmove(history, history + 1,
+                sizeof(history[0]) * (MAX_LINES - 1));
         line_count--;
     }
-    snprintf(history[line_count], MAX_LINE_LEN, "%s", s);
-    line_count++;
+
+    snprintf(history[line_count++], MAX_LINE_LEN, "%s", s);
 }
 
 static void save_command(const char *cmd)
 {
-    if (cmd_history_count < CMD_HISTORY_SIZE) {
-        snprintf(cmd_history[cmd_history_count++], CMD_SIZE, "%s", cmd);
-    } else {
+    if (cmd_history_count == CMD_HISTORY_SIZE) {
         memmove(cmd_history, cmd_history + 1,
-                (CMD_HISTORY_SIZE - 1) * sizeof(cmd_history[0]));
-        snprintf(cmd_history[CMD_HISTORY_SIZE - 1], CMD_SIZE, "%s", cmd);
+                sizeof(cmd_history[0]) * (CMD_HISTORY_SIZE - 1));
+        cmd_history_count--;
     }
+
+    snprintf(cmd_history[cmd_history_count++], CMD_SIZE, "%s", cmd);
 }
 
 static Window create_win(int x, int y, int w, int h, int b)
 {
-    Window win = XCreateSimpleWindow(dpy, root, x, y, w, h, b,
-                                     WhitePixel(dpy, scr), BlackPixel(dpy, scr));
+    Window win = XCreateSimpleWindow(
+        dpy, root, x, y, w, h, b,
+        WhitePixel(dpy, scr), BlackPixel(dpy, scr));
+
     XSelectInput(dpy, win, ExposureMask | KeyPressMask |
                  ButtonPressMask | StructureNotifyMask);
+
     wm_delete_window = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wm_delete_window, 1);
-    XStoreName(dpy, win, use_process_mode ? "Terminator (process mode)" : "Terminator (thread mode)");
+    XStoreName(dpy, win, "Terminator");
+
     return win;
 }
 
 static int run_builtin(char **args, int argc)
 {
-    if (argc == 0) {
-        last_status = 0;
+    if (argc == 0)
         return 1;
-    }
 
-    if (strcmp(args[0], "cd") == 0) {
-        const char *path = argc < 2 ? getenv("HOME") : args[1];
-        char expanded[CMD_SIZE];
+    if (!strcmp(args[0], "cd")) {
+        const char *path = argc > 1 ? args[1] : getenv("HOME");
 
-        if (path == NULL) {
+        if (!path) {
             add_line("terminator: cd: HOME not set");
             last_status = 1;
-            return 1;
-        }
-
-        if (path[0] == '~' && (path[1] == '/' || path[1] == '\0')) {
-            const char *home = getenv("HOME");
-            if (home == NULL) {
-                add_line("terminator: cd: HOME not set");
-                last_status = 1;
-                return 1;
-            }
-            snprintf(expanded, sizeof(expanded), "%s%s", home, path + 1);
-            path = expanded;
-        }
-
-        if (chdir(path) == -1) {
+        } else if (chdir(path) == -1) {
             char msg[CMD_SIZE];
-            snprintf(msg, sizeof(msg), "terminator: cd: %s: %s",
-                     path, strerror(errno));
+            snprintf(msg, sizeof(msg), "cd: %s", strerror(errno));
             add_line(msg);
             last_status = 1;
         } else {
             last_status = 0;
         }
+
         return 1;
     }
 
-    if (strcmp(args[0], "exit") == 0) {
-        if (argc > 1) {
-            char *end;
-            long value = strtol(args[1], &end, 10);
-            if (*end == '\0')
-                last_status = (unsigned char)value;
-            else
-                last_status = 2;
-        }
+    if (!strcmp(args[0], "exit")) {
+        if (argc > 1)
+            last_status = atoi(args[1]);
         shell_running = 0;
         return 1;
     }
 
-    if (strcmp(args[0], "history") == 0) {
+    if (!strcmp(args[0], "history")) {
         for (int i = 0; i < cmd_history_count; i++) {
             char msg[CMD_SIZE + 32];
-            snprintf(msg, sizeof(msg), "%5d  %s", i + 1, cmd_history[i]);
+            snprintf(msg, sizeof(msg), "%5d  %s",
+                     i + 1, cmd_history[i]);
             add_line(msg);
         }
+
         last_status = 0;
         return 1;
     }
@@ -146,190 +137,573 @@ static int run_builtin(char **args, int argc)
     return 0;
 }
 
-static int quotes_balanced(const char *cmd)
+/*
+ * Tokenizer:
+ * - Handles single and double quotes.
+ * - Handles backslash escapes outside single quotes.
+ * - Recognizes |, <, >, >>, 2>, 2>> and &.
+ * - Operators are returned as separate tokens.
+ */
+
+static int tokenize(char *src, char *tokens[], int max_tokens)
 {
-    char quote = '\0';
-    char outer_quote[128];
-    int subst_depth = 0;
-    int backtick_depth = 0;
-    int escaped = 0;
-    int stack_top = 0;
-    size_t len = strlen(cmd);
-
-    if (len > 0 && cmd[len - 1] == '\\') {
-        size_t slashes = 0;
-        while (len > slashes && cmd[len - 1 - slashes] == '\\')
-            slashes++;
-        if (slashes % 2 == 1)
-            return 1;
-    }
-
-    for (size_t i = 0; cmd[i]; i++) {
-        char c = cmd[i];
-
-        if (escaped) {
-            escaped = 0;
-            continue;
-        }
-
-        if (c == '\\' && quote != '\'') {
-            escaped = 1;
-            continue;
-        }
-
-        if (quote == '\'') {
-            if (c == '\'')
-                quote = '\0';
-            continue;
-        }
-
-        if (quote == '"') {
-            if (c == '"') {
-                quote = '\0';
-                continue;
-            }
-
-            if (c == '`') {
-                if (backtick_depth == 0 && stack_top < 128) {
-                    outer_quote[stack_top++] = quote;
-                    backtick_depth++;
-                    quote = '\0';
-                } else if (backtick_depth > 0) {
-                    backtick_depth--;
-                    quote = stack_top > 0
-                        ? outer_quote[--stack_top] : '"';
-                }
-                continue;
-            }
-
-            if (c == '$' && cmd[i + 1] == '(') {
-                if (stack_top < 128) {
-                    outer_quote[stack_top++] = quote;
-                    subst_depth++;
-                    quote = '\0';
-                    i++;
-                }
-                continue;
-            }
-
-            continue;
-        }
-
-        if (c == '\'' || c == '"') {
-            quote = c;
-            continue;
-        }
-
-        if (c == '`') {
-            if (backtick_depth == 0 && stack_top < 128) {
-                outer_quote[stack_top++] = quote;
-                backtick_depth++;
-            } else if (backtick_depth > 0) {
-                backtick_depth--;
-                quote = stack_top > 0
-                    ? outer_quote[--stack_top] : '\0';
-            }
-            continue;
-        }
-
-        if (c == '$' && cmd[i + 1] == '(') {
-            if (stack_top < 128) {
-                outer_quote[stack_top++] = quote;
-                subst_depth++;
-                quote = '\0';
-                i++;
-            }
-            continue;
-        }
-
-        if (subst_depth > 0 && c == '(') {
-            subst_depth++;
-            continue;
-        }
-
-        if (subst_depth > 0 && c == ')') {
-            subst_depth--;
-            if (stack_top > 0)
-                quote = outer_quote[--stack_top];
-        }
-    }
-
-    return quote != '\0' || subst_depth > 0 ||
-           backtick_depth > 0 || escaped;
-}
-
-static int tokenize_command(char *cmd, char *args[MAX_ARGS])
-{
-    char *r = cmd;
-    char *w = cmd;
-    char quote;
-    int argc = 0;
+    char *r = src;
+    int count = 0;
 
     while (*r) {
         while (isspace((unsigned char)*r))
             r++;
+
         if (!*r)
             break;
-        if (argc >= MAX_ARGS - 1)
+
+        if (count >= max_tokens - 1 ||
+            count >= MAX_ARGS * 2)
             return -1;
 
-        args[argc++] = w;
-        quote = '\0';
+        if (*r == '2' && r[1] == '>') {
+            tokens[count++] = "2>";
+            r += 2;
+
+            if (*r == '>') {
+                tokens[count - 1] = "2>>";
+                r++;
+            }
+            continue;
+        }
+
+        if (*r == '|') {
+            tokens[count++] = "|";
+            r++;
+            continue;
+        }
+
+        if (*r == '<') {
+            tokens[count++] = "<";
+            r++;
+            continue;
+        }
+
+        if (*r == '>') {
+            tokens[count++] = ">";
+            r++;
+
+            if (*r == '>') {
+                tokens[count - 1] = ">>";
+                r++;
+            }
+            continue;
+        }
+
+        if (*r == '&') {
+            tokens[count++] = "&";
+            r++;
+            continue;
+        }
+
+        char *w = token_storage[count];
+        char quote = 0;
 
         while (*r) {
-            if (!quote && isspace((unsigned char)*r))
+            if (!quote &&
+                (isspace((unsigned char)*r) ||
+                 *r == '|' || *r == '<' ||
+                 *r == '>' || *r == '&'))
                 break;
+
             if (!quote && (*r == '\'' || *r == '"')) {
                 quote = *r++;
                 continue;
             }
+
             if (quote && *r == quote) {
-                quote = '\0';
+                quote = 0;
                 r++;
                 continue;
             }
+
             if (*r == '\\' && quote != '\'' && r[1]) {
                 r++;
-                *w++ = *r++;
-                continue;
             }
+
+            if (w >= token_storage[count] + MAX_CMD - 1)
+                return -1;
+
             *w++ = *r++;
         }
 
-        if (*r && isspace((unsigned char)*r))
-            r++;
-        *w++ = '\0';
+        if (quote) {
+            add_line("terminator: unmatched quote");
+            return -1;
+        }
+
+        *w = '\0';
+        tokens[count] = token_storage[count];
+        count++;
     }
-    args[argc] = NULL;
-    return argc;
+
+    tokens[count] = NULL;
+    return count;
 }
 
-static void expand_status(char *cmd, size_t cap)
-{
-    char out[MAX_CMD];
-    size_t i = 0, j = 0;
-    char status_text[32];
 
-    snprintf(status_text, sizeof(status_text), "%d", last_status);
-    while (cmd[i] && j + 1 < sizeof(out)) {
-        if (cmd[i] == '$' && cmd[i + 1] == '?') {
-            size_t n = strlen(status_text);
-            if (j + n >= sizeof(out))
-                break;
-            memcpy(out + j, status_text, n);
-            j += n;
-            i += 2;
+static int is_operator(const char *s)
+{
+    return !strcmp(s, "|") || !strcmp(s, "<") ||
+           !strcmp(s, ">") || !strcmp(s, ">>") ||
+           !strcmp(s, "2>") || !strcmp(s, "2>>") ||
+           !strcmp(s, "&");
+}
+
+static int parse_pipeline(char *tokens[], int nt,
+                          Stage stages[], int *nstages)
+{
+    int s = 0;
+
+    memset(stages, 0, sizeof(Stage) * MAX_STAGES);
+    *nstages = 1;
+
+    for (int i = 0; i < nt; i++) {
+        Stage *st = &stages[s];
+
+        if (!strcmp(tokens[i], "|")) {
+            if (st->argc == 0 || s + 1 >= MAX_STAGES) {
+                add_line("terminator: invalid pipeline");
+                return 0;
+            }
+
+            s++;
+            (*nstages)++;
+            continue;
+        }
+
+        if (!strcmp(tokens[i], "&")) {
+            if (i != nt - 1) {
+                add_line("terminator: unexpected &");
+                return 0;
+            }
+
+            st->background = 1;
+            continue;
+        }
+
+        if (!strcmp(tokens[i], "<") ||
+            !strcmp(tokens[i], ">") ||
+            !strcmp(tokens[i], ">>") ||
+            !strcmp(tokens[i], "2>") ||
+            !strcmp(tokens[i], "2>>")) {
+
+            char *op = tokens[i];
+
+            if (++i >= nt || is_operator(tokens[i])) {
+                add_line("terminator: missing redirection filename");
+                return 0;
+            }
+
+            if (!strcmp(op, "<"))
+                st->input = tokens[i];
+            else if (!strcmp(op, ">") || !strcmp(op, ">>")) {
+                st->output = tokens[i];
+                st->append = !strcmp(op, ">>");
+            } else {
+                st->error = tokens[i];
+
+                if (!strcmp(op, "2>>"))
+                    st->append = 1;
+            }
+
+            continue;
+        }
+
+        if (st->argc >= MAX_ARGS - 1) {
+            add_line("terminator: too many arguments");
+            return 0;
+        }
+
+        st->args[st->argc++] = tokens[i];
+    }
+
+    for (int i = 0; i < *nstages; i++) {
+        if (stages[i].argc == 0) {
+            add_line("terminator: empty pipeline stage");
+            return 0;
+        }
+
+        stages[i].args[stages[i].argc] = NULL;
+    }
+
+    return 1;
+}
+
+/* Expand wildcard arguments without using a shell. */
+static void expand_globs(Stage *st)
+{
+    char *expanded[MAX_ARGS];
+    int n = 0;
+
+    for (int i = 0; i < st->argc; i++) {
+        glob_t g;
+        memset(&g, 0, sizeof(g));
+
+        int rc = glob(st->args[i], 0, NULL, &g);
+
+        if (rc == 0) {
+            for (size_t j = 0; j < g.gl_pathc &&
+                 n < MAX_ARGS - 1; j++)
+                expanded[n++] = strdup(g.gl_pathv[j]);
         } else {
-            out[j++] = cmd[i++];
+            if (n < MAX_ARGS - 1)
+                expanded[n++] = strdup(st->args[i]);
+        }
+
+        globfree(&g);
+    }
+
+    for (int i = 0; i < n; i++)
+        st->args[i] = expanded[i];
+
+    st->argc = n;
+    st->args[n] = NULL;
+}
+
+static int open_redirections(Stage *st)
+{
+    int fd;
+
+    if (st->input) {
+        fd = open(st->input, O_RDONLY);
+
+        if (fd == -1) {
+            dprintf(STDERR_FILENO, "%s: %s\n",
+                    st->input, strerror(errno));
+            return 0;
+        }
+
+        if (dup2(fd, STDIN_FILENO) == -1) {
+            close(fd);
+            return 0;
+        }
+
+        close(fd);
+    }
+
+    if (st->output) {
+        int flags = O_WRONLY | O_CREAT |
+                    (st->append ? O_APPEND : O_TRUNC);
+
+        fd = open(st->output, flags, 0666);
+
+        if (fd == -1) {
+            dprintf(STDERR_FILENO, "%s: %s\n",
+                    st->output, strerror(errno));
+            return 0;
+        }
+
+        if (dup2(fd, STDOUT_FILENO) == -1) {
+            close(fd);
+            return 0;
+        }
+
+        close(fd);
+    }
+
+    if (st->error) {
+        int flags = O_WRONLY | O_CREAT |
+                    (st->append ? O_APPEND : O_TRUNC);
+
+        fd = open(st->error, flags, 0666);
+
+        if (fd == -1) {
+            dprintf(STDERR_FILENO, "%s: %s\n",
+                    st->error, strerror(errno));
+            return 0;
+        }
+
+        if (dup2(fd, STDERR_FILENO) == -1) {
+            close(fd);
+            return 0;
+        }
+
+        close(fd);
+    }
+
+    return 1;
+}
+
+
+static void child_exec(Stage *st, int input_fd, int output_fd,
+                       int capture_fd, int pipes[][2], int npipes)
+{
+    if (input_fd != -1 && dup2(input_fd, STDIN_FILENO) == -1)
+        _exit(126);
+
+    if (output_fd != -1) {
+        if (dup2(output_fd, STDOUT_FILENO) == -1)
+            _exit(126);
+    } else if (capture_fd != -1) {
+        if (dup2(capture_fd, STDOUT_FILENO) == -1)
+            _exit(126);
+    }
+
+if (capture_fd != -1 &&
+    dup2(capture_fd, STDERR_FILENO) == -1)
+    _exit(126);
+
+    for (int i = 0; i < npipes; i++) {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+
+    if (input_fd != -1 && input_fd != STDIN_FILENO)
+        close(input_fd);
+
+    if (output_fd != -1 && output_fd != STDOUT_FILENO)
+        close(output_fd);
+
+    if (capture_fd != -1 &&
+        capture_fd != STDOUT_FILENO &&
+        capture_fd != STDERR_FILENO)
+        close(capture_fd);
+
+    if (!open_redirections(st))
+        _exit(1);
+
+    if (!strcmp(st->args[0], "cd")) {
+        const char *path = st->argc > 1
+                         ? st->args[1] : getenv("HOME");
+
+        if (!path || chdir(path) == -1) {
+            dprintf(STDERR_FILENO, "cd: %s\n", strerror(errno));
+            _exit(1);
+        }
+
+        _exit(0);
+    }
+
+    if (!strcmp(st->args[0], "history")) {
+        for (int i = 0; i < cmd_history_count; i++)
+            dprintf(STDOUT_FILENO, "%5d  %s\n",
+                    i + 1, cmd_history[i]);
+
+        _exit(0);
+    }
+
+    execvp(st->args[0], st->args);
+
+    dprintf(STDERR_FILENO, "%s: %s\n",
+            st->args[0], strerror(errno));
+    _exit(errno == ENOENT ? 127 : 126);
+}
+
+
+static void execute_pipeline(Stage stages[], int n)
+{
+    int pipes[MAX_STAGES - 1][2];
+    pid_t pids[MAX_STAGES];
+    int capture[2];
+    int npipes = n - 1;
+    int background = stages[n - 1].background;
+    int status = 0;
+
+    /*
+     * A single command with no redirections can run a stateful
+     * built-in directly in the parent shell.
+     */
+    if (n == 1 && !stages[0].input &&
+        !stages[0].output && !stages[0].error &&
+        !background && run_builtin(stages[0].args,
+                                   stages[0].argc))
+        return;
+
+    for (int i = 0; i < n; i++)
+        expand_globs(&stages[i]);
+
+    for (int i = 0; i < npipes; i++) {
+        if (pipe(pipes[i]) == -1) {
+            add_line("terminator: pipe failed");
+            last_status = 1;
+
+            for (int j = 0; j < i; j++) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+
+            return;
         }
     }
-    out[j] = '\0';
-    snprintf(cmd, cap, "%s", out);
+
+    if (pipe(capture) == -1) {
+        add_line("terminator: output capture pipe failed");
+
+        for (int i = 0; i < npipes; i++) {
+            close(pipes[i][0]);
+            close(pipes[i][1]);
+        }
+
+        last_status = 1;
+        return;
+    }
+
+    for (int i = 0; i < n; i++) {
+        pid_t pid = fork();
+
+        if (pid == -1) {
+            add_line("terminator: fork failed");
+            last_status = 1;
+
+            for (int j = 0; j < npipes; j++) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+
+            close(capture[0]);
+            close(capture[1]);
+
+            for (int j = 0; j < i; j++)
+                kill(pids[j], SIGTERM);
+
+            for (int j = 0; j < i; j++)
+                while (waitpid(pids[j], NULL, 0) == -1 &&
+                       errno == EINTR) {}
+
+            return;
+        }
+
+        if (pid == 0) {
+            int in = i > 0 ? pipes[i - 1][0] : -1;
+            int out = i < n - 1 ? pipes[i][1] : -1;
+
+            close(capture[0]);
+
+            child_exec(&stages[i], in, out,
+                       i == n - 1 ? capture[1] : -1,
+                       pipes, npipes);
+        }
+
+        pids[i] = pid;
+    }
+
+    for (int i = 0; i < npipes; i++) {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+
+    close(capture[1]);
+
+    if (background) {
+        close(capture[0]);
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[background] PID %ld",
+                 (long)pids[n - 1]);
+        add_line(msg);
+
+        last_status = 0;
+        return;
+    }
+
+    /*
+     * Read output before waiting: otherwise a child producing
+     * lots of output could block on a full capture pipe.
+     */
+    FILE *fp = fdopen(capture[0], "r");
+
+    if (fp) {
+        char buf[MAX_LINE_LEN];
+        char out[MAX_LINE_LEN];
+        size_t len = 0;
+
+        while (fgets(buf, sizeof(buf), fp)) {
+            for (size_t i = 0; buf[i]; i++) {
+                if (buf[i] == '\r')
+                    continue;
+
+                if (buf[i] == '\n' || len == MAX_LINE_LEN - 1) {
+                    out[len] = '\0';
+                    add_line(out);
+                    len = 0;
+
+                    if (buf[i] == '\n')
+                        continue;
+                }
+
+                if (len < MAX_LINE_LEN - 1)
+                    out[len++] = buf[i];
+            }
+        }
+
+        if (len) {
+            out[len] = '\0';
+            add_line(out);
+        }
+
+        fclose(fp);
+    } else {
+        close(capture[0]);
+    }
+
+    for (int i = 0; i < n; i++) {
+        while (waitpid(pids[i], &status, 0) == -1) {
+            if (errno == EINTR)
+                continue;
+
+            status = -1;
+            break;
+        }
+
+        if (i == n - 1) {
+            if (status != -1 && WIFEXITED(status))
+                last_status = WEXITSTATUS(status);
+            else if (status != -1 && WIFSIGNALED(status))
+                last_status = 128 + WTERMSIG(status);
+            else
+                last_status = 1;
+        }
+    }
 }
 
-static int check_input_file(const char *cmd)
+static void execute_command(char *cmd)
 {
-    char quote = '\0';
+    char copy[MAX_CMD];
+    char *tokens[MAX_ARGS * 2];
+    Stage stages[MAX_STAGES];
+    int nt, nstages;
+
+    if (!cmd || !*cmd)
+        return;
+
+    if (strlen(cmd) >= MAX_CMD) {
+        add_line("terminator: command too long");
+        last_status = 2;
+        return;
+    }
+
+    save_command(cmd);
+    snprintf(copy, sizeof(copy), "%s", cmd);
+
+    nt = tokenize(copy, tokens, MAX_ARGS * 2);
+
+    if (nt < 0) {
+        last_status = 2;
+        return;
+    }
+
+    if (nt == 0) {
+        last_status = 0;
+        return;
+    }
+
+    if (!parse_pipeline(tokens, nt, stages, &nstages)) {
+        last_status = 2;
+        return;
+    }
+
+    execute_pipeline(stages, nstages);
+}
+
+static int quotes_balanced(const char *cmd)
+{
+    char quote = 0;
     int escaped = 0;
 
     for (size_t i = 0; cmd[i]; i++) {
@@ -347,274 +721,78 @@ static int check_input_file(const char *cmd)
 
         if (quote) {
             if (c == quote)
-                quote = '\0';
-            continue;
-        }
-
-        if (c == '\'' || c == '"') {
+                quote = 0;
+        } else if (c == '\'' || c == '"') {
             quote = c;
-            continue;
-        }
-
-        if (c == '<' && cmd[i + 1] != '<' &&
-            (i == 0 || cmd[i - 1] != '<')) {
-            size_t j = i + 1;
-
-            while (cmd[j] && isspace((unsigned char)cmd[j]))
-                j++;
-
-            if (cmd[j] == '\0') {
-                add_line("terminator: missing input filename");
-                last_status = 2;
-                return 0;
-            }
-
-            if (cmd[j] == '\'' || cmd[j] == '"') {
-                char q = cmd[j++];
-                size_t start = j;
-
-                while (cmd[j] && cmd[j] != q)
-                    j++;
-
-                if (cmd[j] == '\0') {
-                    add_line("terminator: invalid input filename");
-                    last_status = 2;
-                    return 0;
-                }
-
-                char filename[CMD_SIZE];
-                size_t n = j - start;
-
-                if (n >= sizeof(filename))
-                    n = sizeof(filename) - 1;
-
-                memcpy(filename, cmd + start, n);
-                filename[n] = '\0';
-
-                if (access(filename, F_OK) == -1 ||
-                    access(filename, R_OK) == -1) {
-                    char msg[CMD_SIZE];
-                    snprintf(msg, sizeof(msg),
-                             "terminator: %.1000s: %.1000s",
-                             filename, strerror(errno));
-                    add_line(msg);
-                    last_status = 1;
-                    return 0;
-                }
-            } else {
-                size_t start = j;
-
-                while (cmd[j] &&
-                       !isspace((unsigned char)cmd[j]) &&
-                       cmd[j] != '|' && cmd[j] != '&' &&
-                       cmd[j] != '<' && cmd[j] != '>')
-                    j++;
-
-                if (j == start) {
-                    add_line("terminator: missing input filename");
-                    last_status = 2;
-                    return 0;
-                }
-
-                char filename[CMD_SIZE];
-                size_t n = j - start;
-
-                if (n >= sizeof(filename))
-                    n = sizeof(filename) - 1;
-
-                memcpy(filename, cmd + start, n);
-                filename[n] = '\0';
-
-                if (access(filename, F_OK) == -1 ||
-                    access(filename, R_OK) == -1) {
-                    char msg[CMD_SIZE];
-                    snprintf(msg, sizeof(msg),
-                             "terminator: %.1000s: %.1000s",
-                             filename, strerror(errno));
-                    add_line(msg);
-                    last_status = 1;
-                    return 0;
-                }
-            }
         }
     }
 
-    return 1;
+    return quote != 0 || escaped;
 }
 
-static void execute_command(char *cmd)
-{
-    int fd[2], status;
-    pid_t pid;
-    char *args[MAX_ARGS];
-    char buffer[256], output[MAX_LINE_LEN];
-    char shell_cmd[MAX_CMD];
-    int argc;
-    size_t out_len = 0;
-    FILE *fp;
-
-    if (cmd[0] == '\0')
-        return;
-
-    save_command(cmd);
-
-    if (strlen(cmd) >= MAX_CMD) {
-        add_line("terminator: command too long");
-        last_status = 2;
-        return;
-    }
-
-    expand_status(cmd, MAX_CMD);
-    snprintf(shell_cmd, sizeof(shell_cmd), "%s", cmd);
-    argc = tokenize_command(cmd, args);
-
-    if (argc < 0) {
-        add_line("terminator: too many arguments");
-        last_status = 2;
-        return;
-    }
-
-    if (argc == 0) {
-        last_status = 0;
-        return;
-    }
-
-    if (run_builtin(args, argc))
-        return;
-        
-    if (!check_input_file(shell_cmd))
-    	return;
-
-    /*
-     * Let /bin/bash parse compound shell syntax (pipelines, redirections,
-     * &&, ||, globbing, variables and scripts). The outer shell still owns
-     * the X11 UI and captures stdout/stderr for display in its output area.
-     */
-    if (pipe(fd) == -1) {
-        add_line("terminator: pipe failed");
-        last_status = 1;
-        return;
-    }
-
-    pid = fork();
-    if (pid == -1) {
-        close(fd[0]);
-        close(fd[1]);
-        add_line("terminator: fork failed");
-        last_status = 1;
-        return;
-    }
-
-    if (pid == 0) {
-        close(fd[0]);
-        if (dup2(fd[1], STDOUT_FILENO) == -1 ||
-            dup2(fd[1], STDERR_FILENO) == -1)
-            _exit(126);
-        close(fd[1]);
-        execlp("/bin/bash", "bash", "-c", shell_cmd, (char *)NULL);
-        dprintf(STDERR_FILENO, "terminator: bash: %s\n", strerror(errno));
-        _exit(127);
-    }
-
-    close(fd[1]);
-    fp = fdopen(fd[0], "r");
-    if (fp == NULL) {
-        close(fd[0]);
-        while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {}
-        add_line("terminator: fdopen failed");
-        last_status = 1;
-        return;
-    }
-
-    while (fgets(buffer, sizeof(buffer), fp) != NULL) {
-        size_t i;
-        for (i = 0; buffer[i] != '\0'; i++) {
-            if (buffer[i] == '\r') continue;
-            if (buffer[i] == '\n') {
-                output[out_len] = '\0';
-                add_line(output);
-                out_len = 0;
-            } else {
-                output[out_len++] = buffer[i];
-                if (out_len == MAX_LINE_LEN - 1) {
-                    output[out_len] = '\0';
-                    add_line(output);
-                    out_len = 0;
-                }
-            }
-        }
-    }
-    if (out_len > 0) {
-        output[out_len] = '\0';
-        add_line(output);
-    }
-    fclose(fp);
-
-    while (waitpid(pid, &status, 0) == -1) {
-        if (errno != EINTR) {
-            last_status = 1;
-            return;
-        }
-    }
-    if (WIFEXITED(status)) last_status = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status)) last_status = 128 + WTERMSIG(status);
-    else last_status = 1;
-}
-
-static void draw_terminal(Window win, GC gc, const char *cmd, int len)
+static void draw_terminal(Window win, GC gc,
+                          const char *cmd, int len)
 {
     XWindowAttributes attr;
-    int visible, cmd_lines = 1, total, max_scroll, start, i, pos;
 
     if (!XGetWindowAttributes(dpy, win, &attr))
         return;
 
-    visible = (attr.height - 20) / LINE_HEIGHT;
+    int visible = (attr.height - 20) / LINE_HEIGHT;
     if (visible < 1)
         visible = 1;
 
-    for (i = 0; i < len; i++)
+    int cmd_lines = 1;
+
+    for (int i = 0; i < len; i++)
         if (cmd[i] == '\n')
             cmd_lines++;
 
-    total = line_count + cmd_lines;
-    max_scroll = total > visible ? total - visible : 0;
+    int total = line_count + cmd_lines;
+    int max_scroll = total > visible ? total - visible : 0;
+
     if (scroll_offset > max_scroll)
         scroll_offset = max_scroll;
     if (scroll_offset < 0)
         scroll_offset = 0;
 
-    start = total - visible - scroll_offset;
+    int start = total - visible - scroll_offset;
     if (start < 0)
         start = 0;
 
     XClearWindow(dpy, win);
 
-    for (i = start; i < total && i < start + visible; i++) {
+    for (int i = start; i < total && i < start + visible; i++) {
         int y = 20 + (i - start) * LINE_HEIGHT;
 
         if (i < line_count) {
-            XDrawString(dpy, win, gc, 10, y, history[i], (int)strlen(history[i]));
+            XDrawString(dpy, win, gc, 10, y,
+                        history[i], (int)strlen(history[i]));
         } else {
             int line_no = i - line_count;
-            int begin, end, j;
-            pos = 0;
-            for (j = 0; j < line_no; j++) {
+            int pos = 0;
+
+            for (int j = 0; j < line_no; j++) {
                 while (pos < len && cmd[pos] != '\n')
                     pos++;
                 if (pos < len)
                     pos++;
             }
-            begin = pos;
-            end = begin;
-            while (end < len && cmd[end] != '\n')
-                end++;
 
-            XDrawString(dpy, win, gc, 10, y, line_no == 0 ? "$ " : "> ", 2);
-            if (end > begin)
-                XDrawString(dpy, win, gc, 25, y, cmd + begin, end - begin);
+            int begin = pos;
+
+            while (pos < len && cmd[pos] != '\n')
+                pos++;
+
+            XDrawString(dpy, win, gc, 10, y,
+                        line_no == 0 ? "$ " : "> ", 2);
+
+            if (pos > begin)
+                XDrawString(dpy, win, gc, 25, y,
+                            cmd + begin, pos - begin);
         }
     }
+
     XFlush(dpy);
 }
 
@@ -628,22 +806,32 @@ static void run(Window win)
     int running = 1;
 
     cmd[0] = '\0';
+
     values.foreground = WhitePixel(dpy, scr);
     values.background = BlackPixel(dpy, scr);
+
     gc = XCreateGC(dpy, win, GCForeground | GCBackground, &values);
     XMapWindow(dpy, win);
+    
+    XFlush(dpy);
+
+    XEvent event;
+    do {
+        XNextEvent(dpy, &event);
+    } while (event.type != MapNotify);
+
+    XSetInputFocus(dpy, win, RevertToParent, CurrentTime);
+    XFlush(dpy);
 
     while (running && shell_running) {
         XNextEvent(dpy, &ev);
 
         switch (ev.type) {
         case Expose:
-            if (ev.xexpose.count == 0)
-                draw_terminal(win, gc, cmd, len);
-            break;
-
         case ConfigureNotify:
-            draw_terminal(win, gc, cmd, len);
+            if (ev.type == ConfigureNotify ||
+                ev.xexpose.count == 0)
+                draw_terminal(win, gc, cmd, len);
             break;
 
         case ClientMessage:
@@ -656,69 +844,68 @@ static void run(Window win)
         case ButtonPress:
             if (ev.xbutton.button == Button4)
                 scroll_offset += 3;
-            else if (ev.xbutton.button == Button5) {
+            else if (ev.xbutton.button == Button5)
                 scroll_offset -= 3;
-                if (scroll_offset < 0)
-                    scroll_offset = 0;
-            }
+
             draw_terminal(win, gc, cmd, len);
             break;
 
         case KeyPress: {
             char text[32];
             KeySym key;
-            int n = XLookupString(&ev.xkey, text, sizeof(text), &key, NULL);
+            int n = XLookupString(&ev.xkey, text,
+                                  sizeof(text), &key, NULL);
 
             if (key == XK_Return || key == XK_KP_Enter) {
-                if (ev.xkey.state & ShiftMask) {
-			if (len < MAX_CMD - 1) {
-			    cmd[len++] = '\n';
-			    cmd[len] = '\0';
-			}
-		    } else if (quotes_balanced(cmd)) {
-			if (len < MAX_CMD - 1) {
-			    cmd[len++] = '\n';
-			    cmd[len] = '\0';
-			}
-		    } else {
+                if ((ev.xkey.state & ShiftMask) ||
+                    quotes_balanced(cmd)) {
+                    if (len < MAX_CMD - 1) {
+                        cmd[len++] = '\n';
+                        cmd[len] = '\0';
+                    }
+                } else {
                     char command[MAX_CMD];
-                    char prompt[MAX_LINE_LEN];
-                    char *line, *next;
-
-                    cmd[len] = '\0';
                     snprintf(command, sizeof(command), "%s", cmd);
 
-                    line = cmd;
+                    char *line = cmd;
+                    char *next;
+
                     do {
                         next = strchr(line, '\n');
                         if (next)
                             *next = '\0';
+
+                        char prompt[MAX_LINE_LEN];
                         snprintf(prompt, sizeof(prompt), "%s%s",
                                  line == cmd ? "$ " : "> ", line);
                         add_line(prompt);
+
                         if (!next)
                             break;
+
                         line = next + 1;
                     } while (1);
 
-                    if (len > 0)
+                    if (len)
                         execute_command(command);
 
                     len = 0;
                     cmd[0] = '\0';
                     scroll_offset = 0;
                 }
-            } else if (key == XK_BackSpace || key == XK_Delete) {
-                if (len > 0) {
-                    len--;
-                    cmd[len] = '\0';
-                }
+            } else if (key == XK_BackSpace ||
+                       key == XK_Delete) {
+                if (len > 0)
+                    cmd[--len] = '\0';
+
                 scroll_offset = 0;
-            } else if (n > 0 && text[0] >= 32 && text[0] <= 126) {
+            } else if (n > 0 && text[0] >= 32 &&
+                       text[0] <= 126) {
                 if (len < MAX_CMD - 1) {
                     cmd[len++] = text[0];
                     cmd[len] = '\0';
                 }
+
                 scroll_offset = 0;
             }
 
@@ -731,26 +918,22 @@ static void run(Window win)
     XFreeGC(dpy, gc);
 }
 
-int main(int argc, char **argv)
+int main(void)
 {
-    Window win;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "useProcess=True") == 0) use_process_mode = 1;
-        else if (strcmp(argv[i], "useProcess=False") == 0) use_process_mode = 0;
-        else { fprintf(stderr, "Usage: %s [useProcess=True|useProcess=False]\n", argv[0]); return 2; }
-    }
-
     if ((dpy = XOpenDisplay(NULL)) == NULL)
         err(1, "Can't open display");
 
     scr = DefaultScreen(dpy);
     root = RootWindow(dpy, scr);
-    win = create_win(POSX, POSY, WIDTH, HEIGHT, BORDER);
+
+    Window win = create_win(POSX, POSY, WIDTH, HEIGHT, BORDER);
 
     run(win);
 
     XUnmapWindow(dpy, win);
     XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);
+
     return last_status;
 }
+
