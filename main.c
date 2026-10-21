@@ -327,6 +327,121 @@ static void expand_status(char *cmd, size_t cap)
     snprintf(cmd, cap, "%s", out);
 }
 
+static int check_input_file(const char *cmd)
+{
+    char quote = '\0';
+    int escaped = 0;
+
+    for (size_t i = 0; cmd[i]; i++) {
+        char c = cmd[i];
+
+        if (escaped) {
+            escaped = 0;
+            continue;
+        }
+
+        if (c == '\\' && quote != '\'') {
+            escaped = 1;
+            continue;
+        }
+
+        if (quote) {
+            if (c == quote)
+                quote = '\0';
+            continue;
+        }
+
+        if (c == '\'' || c == '"') {
+            quote = c;
+            continue;
+        }
+
+        if (c == '<' && cmd[i + 1] != '<' &&
+            (i == 0 || cmd[i - 1] != '<')) {
+            size_t j = i + 1;
+
+            while (cmd[j] && isspace((unsigned char)cmd[j]))
+                j++;
+
+            if (cmd[j] == '\0') {
+                add_line("terminator: missing input filename");
+                last_status = 2;
+                return 0;
+            }
+
+            if (cmd[j] == '\'' || cmd[j] == '"') {
+                char q = cmd[j++];
+                size_t start = j;
+
+                while (cmd[j] && cmd[j] != q)
+                    j++;
+
+                if (cmd[j] == '\0') {
+                    add_line("terminator: invalid input filename");
+                    last_status = 2;
+                    return 0;
+                }
+
+                char filename[CMD_SIZE];
+                size_t n = j - start;
+
+                if (n >= sizeof(filename))
+                    n = sizeof(filename) - 1;
+
+                memcpy(filename, cmd + start, n);
+                filename[n] = '\0';
+
+                if (access(filename, F_OK) == -1 ||
+                    access(filename, R_OK) == -1) {
+                    char msg[CMD_SIZE];
+                    snprintf(msg, sizeof(msg),
+                             "terminator: %.1000s: %.1000s",
+                             filename, strerror(errno));
+                    add_line(msg);
+                    last_status = 1;
+                    return 0;
+                }
+            } else {
+                size_t start = j;
+
+                while (cmd[j] &&
+                       !isspace((unsigned char)cmd[j]) &&
+                       cmd[j] != '|' && cmd[j] != '&' &&
+                       cmd[j] != '<' && cmd[j] != '>')
+                    j++;
+
+                if (j == start) {
+                    add_line("terminator: missing input filename");
+                    last_status = 2;
+                    return 0;
+                }
+
+                char filename[CMD_SIZE];
+                size_t n = j - start;
+
+                if (n >= sizeof(filename))
+                    n = sizeof(filename) - 1;
+
+                memcpy(filename, cmd + start, n);
+                filename[n] = '\0';
+
+                if (access(filename, F_OK) == -1 ||
+                    access(filename, R_OK) == -1) {
+                    char msg[CMD_SIZE];
+                    snprintf(msg, sizeof(msg),
+                             "terminator: %.1000s: %.1000s",
+                             filename, strerror(errno));
+                    add_line(msg);
+                    last_status = 1;
+                    return 0;
+                }
+            }
+        }
+    }
+
+    return 1;
+}
+
 static void execute_command(char *cmd)
 {
     int fd[2], status;
@@ -366,6 +481,9 @@ static void execute_command(char *cmd)
 
     if (run_builtin(args, argc))
         return;
+        
+    if (!check_input_file(shell_cmd))
+    	return;
 
     /*
      * Let /bin/bash parse compound shell syntax (pipelines, redirections,
