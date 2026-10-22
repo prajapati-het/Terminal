@@ -32,6 +32,7 @@
 
 typedef struct {
     char *args[MAX_ARGS];
+    int glob_allowed[MAX_ARGS];
     int argc;
     char *input;
     char *output;
@@ -44,6 +45,7 @@ static char cmd_history[CMD_HISTORY_SIZE][CMD_SIZE];
 static int cmd_history_count;
 static int last_status;
 static int shell_running = 1;
+static int token_quoted[MAX_ARGS * 2];
 
 static Display *dpy;
 static int scr;
@@ -379,7 +381,9 @@ static int tokenize(char *src, char *tokens[], int max_tokens)
             continue;
         }
 
-        tokens[count++] = w;
+        tokens[count] = w;
+	token_quoted[count] = 0;
+	count++;
         char quote = 0;
 
         while (*r) {
@@ -389,6 +393,7 @@ static int tokenize(char *src, char *tokens[], int max_tokens)
                 break;
 
             if (!quote && (*r == '\'' || *r == '"')) {
+            	token_quoted[count - 1] = 1;
                 quote = *r++;
                 continue;
             }
@@ -400,10 +405,21 @@ static int tokenize(char *src, char *tokens[], int max_tokens)
             }
 
             if (*r == '\\' && quote != '\'' && r[1]) {
-                r++;
-                append_char(&w, *r++);
-                continue;
-            }
+	    if (quote == '"') {
+		if (r[1] == '$' || r[1] == '`' ||
+		        r[1] == '"' || r[1] == '\\') {
+		        r++;
+		        append_char(&w, *r++);
+		    } else {
+		        append_char(&w, *r++);
+		        append_char(&w, *r++);
+		    }
+	        } else {
+		    r++;
+		    append_char(&w, *r++);
+	       }
+	        continue;
+	    }
 
             if (*r == '$' && quote != '\'') {
                 r++;
@@ -543,7 +559,9 @@ static int parse_pipeline(char *tokens[], int nt,
             return 0;
         }
 
-        st->args[st->argc++] = tokens[i];
+        st->args[st->argc] = tokens[i];
+	st->glob_allowed[st->argc] = !token_quoted[i];
+	st->argc++;
     }
 
     for (int i = 0; i < *nstages; i++) {
@@ -563,10 +581,15 @@ static void expand_globs(Stage *st)
 {
     char *expanded[MAX_ARGS];
     int n = 0;
-
+    
     for (int i = 0; i < st->argc; i++) {
         glob_t g;
         memset(&g, 0, sizeof(g));
+        
+        if (!st->glob_allowed[i]) {
+            expanded[n++] = strdup(st->args[i]);
+            continue;
+        }
 
         int rc = glob(st->args[i], 0, NULL, &g);
 
