@@ -28,6 +28,7 @@
 #define CMD_HISTORY_SIZE 1000
 #define CMD_SIZE 2048
 #define MAX_STAGES 128
+#define MAX_EXPANDED_CMD (MAX_CMD * 4)
 
 typedef struct {
     char *args[MAX_ARGS];
@@ -49,6 +50,7 @@ static int scr;
 static Window root;
 static Atom wm_delete_window;
 
+static char expanded_cmd[MAX_EXPANDED_CMD];
 static char history[MAX_LINES][MAX_LINE_LEN];
 static char token_storage[MAX_ARGS * 2][MAX_CMD];
 static int line_count;
@@ -74,6 +76,21 @@ static void save_command(const char *cmd)
     }
 
     snprintf(cmd_history[cmd_history_count++], CMD_SIZE, "%s", cmd);
+}
+
+static void append_char(char **w, char c)
+{
+    if (*w < expanded_cmd + sizeof(expanded_cmd) - 1)
+        *(*w)++ = c;
+}
+
+static void append_text(char **w, const char *s)
+{
+    if (!s)
+        return;
+
+    while (*s)
+        append_char(w, *s++);
 }
 
 static Window create_win(int x, int y, int w, int h, int b)
@@ -144,10 +161,10 @@ static int run_builtin(char **args, int argc)
  * - Recognizes |, <, >, >>, 2>, 2>> and &.
  * - Operators are returned as separate tokens.
  */
-
 static int tokenize(char *src, char *tokens[], int max_tokens)
 {
     char *r = src;
+    char *w = expanded_cmd;
     int count = 0;
 
     while (*r) {
@@ -157,18 +174,12 @@ static int tokenize(char *src, char *tokens[], int max_tokens)
         if (!*r)
             break;
 
-        if (count >= max_tokens - 1 ||
-            count >= MAX_ARGS * 2)
+        if (count >= max_tokens - 1)
             return -1;
 
         if (*r == '2' && r[1] == '>') {
-            tokens[count++] = "2>";
-            r += 2;
-
-            if (*r == '>') {
-                tokens[count - 1] = "2>>";
-                r++;
-            }
+            tokens[count++] = r[2] == '>' ? "2>>" : "2>";
+            r += r[2] == '>' ? 3 : 2;
             continue;
         }
 
@@ -185,13 +196,8 @@ static int tokenize(char *src, char *tokens[], int max_tokens)
         }
 
         if (*r == '>') {
-            tokens[count++] = ">";
-            r++;
-
-            if (*r == '>') {
-                tokens[count - 1] = ">>";
-                r++;
-            }
+            tokens[count++] = r[1] == '>' ? ">>" : ">";
+            r += r[1] == '>' ? 2 : 1;
             continue;
         }
 
@@ -201,14 +207,13 @@ static int tokenize(char *src, char *tokens[], int max_tokens)
             continue;
         }
 
-        char *w = token_storage[count];
+        tokens[count++] = w;
         char quote = 0;
 
         while (*r) {
-            if (!quote &&
-                (isspace((unsigned char)*r) ||
-                 *r == '|' || *r == '<' ||
-                 *r == '>' || *r == '&'))
+            if (!quote && (isspace((unsigned char)*r) ||
+                *r == '|' || *r == '<' || *r == '>' ||
+                *r == '&'))
                 break;
 
             if (!quote && (*r == '\'' || *r == '"')) {
@@ -224,12 +229,60 @@ static int tokenize(char *src, char *tokens[], int max_tokens)
 
             if (*r == '\\' && quote != '\'' && r[1]) {
                 r++;
+                append_char(&w, *r++);
+                continue;
             }
 
-            if (w >= token_storage[count] + MAX_CMD - 1)
-                return -1;
+            if (*r == '$' && quote != '\'') {
+                r++;
 
-            *w++ = *r++;
+                if (*r == '?') {
+                    char value[32];
+                    snprintf(value, sizeof(value), "%d", last_status);
+                    append_text(&w, value);
+                    r++;
+                    continue;
+                }
+
+                char name[256];
+                int j = 0;
+
+                if (*r == '{') {
+                    r++;
+
+                    while (*r && *r != '}' &&
+                           j < (int)sizeof(name) - 1)
+                        name[j++] = *r++;
+
+                    if (*r == '}')
+                        r++;
+                    else {
+                        append_char(&w, '$');
+                        append_char(&w, '{');
+                        name[j] = '\0';
+                        append_text(&w, name);
+                        continue;
+                    }
+                } else {
+                    while ((*r == '_' ||
+                           (*r >= 'a' && *r <= 'z') ||
+                           (*r >= 'A' && *r <= 'Z') ||
+                           (*r >= '0' && *r <= '9')) &&
+                           j < (int)sizeof(name) - 1)
+                        name[j++] = *r++;
+                }
+
+                if (j == 0) {
+                    append_char(&w, '$');
+                    continue;
+                }
+
+                name[j] = '\0';
+                append_text(&w, getenv(name));
+                continue;
+            }
+
+            append_char(&w, *r++);
         }
 
         if (quote) {
@@ -237,9 +290,7 @@ static int tokenize(char *src, char *tokens[], int max_tokens)
             return -1;
         }
 
-        *w = '\0';
-        tokens[count] = token_storage[count];
-        count++;
+        append_char(&w, '\0');
     }
 
     tokens[count] = NULL;
@@ -569,18 +620,20 @@ static void execute_pipeline(Stage stages[], int n)
             return;
         }
 
-        if (pid == 0) {
-            int in = i > 0 ? pipes[i - 1][0] : -1;
-            int out = i < n - 1 ? pipes[i][1] : -1;
+        
+	if (pid == 0) {
+	    int in = i > 0 ? pipes[i - 1][0] : -1;
+	    int out = i < n - 1 ? pipes[i][1] : -1;
+	    int cap = i == n - 1 ? capture[1] : -1;
 
-            close(capture[0]);
+	    close(capture[0]);
 
-            child_exec(&stages[i], in, out,
-                       i == n - 1 ? capture[1] : -1,
-                       pipes, npipes);
-        }
+	    if (cap == -1)
+		close(capture[1]);
 
-        pids[i] = pid;
+	    child_exec(&stages[i], in, out, cap, pipes, npipes);
+	}
+
     }
 
     for (int i = 0; i < npipes; i++) {
@@ -936,4 +989,3 @@ int main(void)
 
     return last_status;
 }
-
