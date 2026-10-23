@@ -1,613 +1,893 @@
-#define _POSIX_C_SOURCE 200810L
+/*
+ * terminator.c -- "Terminator": an X11 terminal emulator + shell written in C.
+ *
+ * Build:  make            (or)  gcc -O2 -std=gnu11 -pthread -o terminator terminator.c -lX11
+ * Run:    ./terminator                 # thread mode  (one process, one thread per tab)
+ *         ./terminator useProcess=True # process mode (one process per tab)
+ *
+ * See DESIGN.md for the architecture discussion.
+ *
+ * A single translation unit keeps the cross-module interfaces honest.  The file
+ * is organised in sections:  types -> history -> parser -> executor ->
+ * builtins -> worker -> config -> GUI -> main.
+ */
+
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/wait.h>
-#include <sys/types.h>
 #include <errno.h>
 #include <signal.h>
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
-#include <err.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <glob.h>
+#include <time.h>
+#include <limits.h>
+#include <strings.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <poll.h>
+#include <pthread.h>
+#include <semaphore.h>
 
-#define POSY 100
-#define POSX 100
-#define WIDTH 700
-#define HEIGHT 500
-#define BORDER 2
-#define MAX_CMD 1024
-#define MAX_ARGS 128
-#define MAX_LINES 10000
-#define MAX_LINE_LEN 2048
-#define LINE_HEIGHT 20
-#define CMD_HISTORY_SIZE 1000
-#define CMD_SIZE 2048
-#define MAX_STAGES 128
-#define MAX_EXPANDED_CMD (MAX_CMD * 4)
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
+#include <X11/keysym.h>
+#include <X11/cursorfont.h>
+
+/* ------------------------------------------------------------------ */
+/* tunables                                                           */
+/* ------------------------------------------------------------------ */
+#define APP_NAME        "terminator"
+#define MAX_TABS        16
+#define MAX_CMD         4096
+#define MAX_EXPANDED    16384
+#define ARENA_SZ        131072
+#define MAX_ARGS        256
+#define MAX_STAGES      64
+#define MAX_LINE_LEN    4096
+#define MAX_SCROLLBACK  4000
+#define HIST_MAX        1000
+#define HIST_ENTRY      2048
+#define LINE_HEIGHT     18
+#define TAB_HEIGHT      30
+#define TAB_WIDTH       110
+#define WIN_W           860
+#define WIN_H           540
+#define SEP_LEN         52          /* length of the multiWatch dash rule */
+#define MW_INTERVAL     2           /* multiWatch / watch re-run period (s) */
+#define MAX_JOBS        32
+#define JOB_CMD_LEN     256
+
+#define MODE_THREAD     0
+#define MODE_PROCESS    1
+
+#define CTL_EXIT        1
+#define CTL_RELOAD      2
+#define CTL_BIND        3
+
+/* Worker-private state is thread-local so that, in thread mode, each tab's
+ * worker thread has its own copy.  In process mode there is a single worker
+ * thread per process, so this is equally correct. */
+#define TSTATIC static __thread
+
+/* ------------------------------------------------------------------ */
+/* types                                                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    sem_t sem;
+    int   count;                 /* number of entries */
+    int   head;                  /* index of oldest entry (ring) */
+    char  entries[HIST_MAX][HIST_ENTRY];
+} HistStore;
+
+typedef struct {
+    char *text;
+    int   quoted;                /* had quoting/escaping -> no globbing */
+    int   has_glob;              /* contains an unquoted * ? [ */
+    int   is_op;                 /* operator token */
+} Token;
 
 typedef struct {
     char *args[MAX_ARGS];
-    int glob_allowed[MAX_ARGS];
-    int argc;
-    char *input;
-    char *output;
-    char *error;
-    int append;
-    int background;
+    int   has_glob[MAX_ARGS];
+    int   argc;
+    char *input;                 /* '<'          */
+    char *output;                /* '>' or '>>'  */
+    char *error;                 /* '2>' or '2>>'*/
+    int   append_out;
+    int   append_err;
+    int   background;
 } Stage;
 
-static char cmd_history[CMD_HISTORY_SIZE][CMD_SIZE];
-static int cmd_history_count;
-static int last_status;
-static int shell_running = 1;
-static int token_quoted[MAX_ARGS * 2];
+typedef struct {
+    int   id;
+    pid_t pgid;
+    pid_t pids[MAX_STAGES];
+    int   npids;
+    int   state;                 /* 0 = running, 1 = done */
+    int   bg;
+    char  cmd[JOB_CMD_LEN];
+} Job;
 
-static Display *dpy;
-static int scr;
-static Window root;
-static Atom wm_delete_window;
+typedef struct {
+    int        in_fd, out_fd, ctl_fd;
+    HistStore *hist;
+    void      *sh;
+    int        mode;
+} WorkerCtx;
 
-static char expanded_cmd[MAX_EXPANDED_CMD];
-static char history[MAX_LINES][MAX_LINE_LEN];
-static char token_storage[MAX_ARGS * 2][MAX_CMD];
-static int line_count;
-static int scroll_offset;
-static int expand_substitutions(const char *src, char *dst, size_t cap);
+/* GUI-side tab state. */
+typedef struct {
+    /* scrollback of finished output lines */
+    char **lines;
+    int    nlines, cap_lines;
+    /* partially received output line */
+    char   pending[MAX_LINE_LEN];
+    int    pending_len;
+    int    scroll;               /* 0 == pinned to bottom */
+    /* current input line(s) being edited */
+    char   input[MAX_CMD];
+    int    len, cursor;
+    int    hist_pos;             /* -1 when not browsing history */
+    char   hist_draft[MAX_CMD];
+    /* prompt / input state (driven by the worker's prompt markers) */
+    int    in_prompt;
+    int    prompt_len;
+    char   prompt[256];
+    int    awaiting;
+    /* pipes */
+    int    in_r, in_w, out_r, out_w, ctl_r, ctl_w;
+    /* worker handle */
+    pthread_t tid;
+    pid_t  pid;
+    int    alive;
+    int    dirty;
+    /* mouse selection (display coordinates) */
+    int    sel_active;
+    int    sel_l0, sel_c0, sel_l1, sel_c1;
+} Tab;
 
-static void add_line(const char *s)
+typedef enum {
+    ACT_NONE = 0,
+    ACT_LEFT, ACT_RIGHT, ACT_BOL, ACT_EOL,
+    ACT_HIST_PREV, ACT_HIST_NEXT,
+    ACT_KILL_START, ACT_KILL_END, ACT_KILL_WORD,
+    ACT_CLEAR, ACT_EXIT, ACT_INTERRUPT, ACT_COPY, ACT_PASTE,
+    ACT_NEW_TAB, ACT_CLOSE_TAB, ACT_NEXT_TAB, ACT_PREV_TAB,
+    ACT_PAGE_UP, ACT_PAGE_DOWN
+} Action;
+
+typedef struct {
+    unsigned int mods;
+    KeySym       ks;
+    Action       act;
+} Binding;
+
+/* ------------------------------------------------------------------ */
+/* globals                                                            */
+/* ------------------------------------------------------------------ */
+
+static HistStore   g_hist_local;      /* thread mode backing store        */
+static HistStore  *g_hist = NULL;     /* shared by every worker           */
+static int         g_mode = MODE_THREAD;
+
+/* worker-private */
+TSTATIC int   g_out_fd = -1;
+TSTATIC int   g_in_fd  = -1;
+TSTATIC int   g_ctl_fd = -1;
+TSTATIC int   g_last_status = 0;
+TSTATIC int   g_exit_requested = 0;
+TSTATIC char  g_arena[ARENA_SZ];
+TSTATIC size_t g_arena_pos = 0;
+TSTATIC char  g_cwd[PATH_MAX];      /* this tab's logical working directory */
+static pthread_mutex_t g_cwd_mtx = PTHREAD_MUTEX_INITIALIZER;
+TSTATIC Job   g_jobs[MAX_JOBS];
+TSTATIC int   g_job_count = 0;
+TSTATIC int   g_next_job_id = 1;
+
+/* GUI-private */
+static Display     *g_dpy = NULL;
+static int          g_scr;
+static Window       g_win;
+static GC           g_gc;
+static XFontStruct *g_font = NULL;
+static int          g_cw = 8;          /* character cell width  */
+static int          g_ch = LINE_HEIGHT;/* character cell height */
+static Atom         g_wm_delete;
+static Atom         g_clipboard, g_utf8, g_targets;
+static Cursor       g_cursor;
+static int          g_running = 1;
+static int          g_win_w = WIN_W, g_win_h = WIN_H;
+
+static Tab  g_tabs[MAX_TABS];
+static int  g_tab_count = 0;
+static int  g_active = 0;
+
+static Binding g_user_binds[64];
+static int     g_n_user_binds = 0;
+static int     g_loading_binds = 0;   /* config-file load: duplicates are conflicts */
+static Binding g_def_binds[64];
+static int     g_n_def_binds = 0;
+
+static char  g_sel_text[65536];
+static int   g_sel_len = 0;
+
+/* ------------------------------------------------------------------ */
+/* prototypes                                                         */
+/* ------------------------------------------------------------------ */
+
+static void  write_all(int fd, const void *buf, size_t n);
+static void  emit(const char *fmt, ...);
+static void  emit_raw(const char *s, size_t n);
+static char *xstrdup(const char *s);
+
+static void history_init(int mode);
+static void history_add(const char *cmd);
+static int  history_count(void);
+static int  history_get(int i, char *buf, size_t cap);
+
+static int  lex(const char *src, Token *toks, int max, char *err, size_t errcap);
+static int  lex_core(const char *src, Token *toks, int max, char *err, size_t errcap, int reset);
+static int  command_incomplete(const char *s);
+static int  parse_stages(Token *toks, int nt, Stage *st, int *nst);
+static int  cmd_substitute(const char *cmd, char *out, size_t cap);
+static int  is_list_op(const Token *t);
+static int  is_redir_op(const Token *t);
+
+static void execute_line(const char *line);
+static void execute_tokens(Token *toks, int nt);
+static void run_one(Token *toks, int nt);
+static int  run_pipeline(Stage *st, int n, int term_out, char *result, size_t cap);
+static void child_exec(Stage *st, int in_fd, int out_fd, int term_out, pid_t pgid,
+                       const char *e_notfound, const char *e_noperm, const char *e_cannot);
+static int  open_redirections(Stage *st);
+static void expand_globs(Stage *st);
+static int  glob_in_cwd(const char *pat, glob_t *g);
+static void wait_foreground(pid_t *pids, int n);
+static void reap_background_jobs(void);
+static int  run_capture(const char *cmd, char *out, size_t cap);
+
+static int  is_builtin(const char *name);
+static int  run_builtin_parent(char **args, int argc);
+static void do_multiwatch(const char *arg);
+static void do_watch(const char *arg);
+
+static void worker_loop(WorkerCtx *ctx);
+static void *worker_thread(void *p);
+static char *worker_read_command(void);
+static int  in_getc(void);
+
+static void bindings_init(void);
+static int  bindings_load(const char *path, int verbose);
+static int  bindings_add_user(const char *keyspec, const char *action, char *err, size_t cap);
+static Action bindings_lookup(unsigned int mods, KeySym ks);
+static int  bindings_save(const char *path);
+static const char *action_name(Action a);
+static Action action_from_name(const char *n);
+static int  parse_keyspec(const char *spec, unsigned int *mods, KeySym *ks);
+static const char *config_path(void);
+
+static void gui_run(void);
+static int  gui_new_tab(void);
+static void gui_close_tab(int idx);
+static void gui_draw(void);
+static void gui_handle_key(XKeyEvent *ke);
+static void gui_append_output(Tab *t, const char *data, int n, int idx);
+static void tab_append_line(Tab *t, const char *s);
+
+/* ------------------------------------------------------------------ */
+/* small utilities                                                    */
+/* ------------------------------------------------------------------ */
+
+static void write_all(int fd, const void *buf, size_t n)
 {
-    if (line_count == MAX_LINES) {
-        memmove(history, history + 1,
-                sizeof(history[0]) * (MAX_LINES - 1));
-        line_count--;
+    const char *p = buf;
+    while (n > 0) {
+        ssize_t k = write(fd, p, n);
+        if (k < 0) {
+            if (errno == EINTR)
+                continue;
+            return;
+        }
+        p += k;
+        n -= (size_t)k;
     }
-
-    snprintf(history[line_count++], MAX_LINE_LEN, "%s", s);
 }
 
-static void save_command(const char *cmd)
+static char *xstrdup(const char *s)
 {
-    if (cmd_history_count == CMD_HISTORY_SIZE) {
-        memmove(cmd_history, cmd_history + 1,
-                sizeof(cmd_history[0]) * (CMD_HISTORY_SIZE - 1));
-        cmd_history_count--;
-    }
-
-    snprintf(cmd_history[cmd_history_count++], CMD_SIZE, "%s", cmd);
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (p)
+        memcpy(p, s, n);
+    return p;
 }
 
-static void append_char(char **w, char c)
+static void emit_raw(const char *s, size_t n)
 {
-    if (*w < expanded_cmd + sizeof(expanded_cmd) - 1)
-        *(*w)++ = c;
+    if (g_out_fd >= 0 && n)
+        write_all(g_out_fd, s, n);
 }
 
-static void append_text(char **w, const char *s)
+static void emit(const char *fmt, ...)
 {
-    if (!s)
+    char buf[8192];
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+
+    if (n <= 0)
         return;
 
-    while (*s)
-        append_char(w, *s++);
+    if ((size_t)n > sizeof buf - 1)
+        n = (int)sizeof buf - 1;
+
+    emit_raw(buf, (size_t)n);
 }
 
-static Window create_win(int x, int y, int w, int h, int b)
+/* ------------------------------------------------------------------ */
+/* shared history                                                     */
+/* ------------------------------------------------------------------ */
+
+static void history_init(int mode)
 {
-    Window win = XCreateSimpleWindow(
-        dpy, root, x, y, w, h, b,
-        WhitePixel(dpy, scr),
-        BlackPixel(dpy, scr)
-    );
-
-    XSelectInput(dpy, win, ExposureMask | KeyPressMask |
-                 ButtonPressMask | StructureNotifyMask);
-
-    wm_delete_window = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(dpy, win, &wm_delete_window, 1);
-    XStoreName(dpy, win, "Terminator");
-
-    return win;
-}
-
-static int execute_command_capture(const char *cmd, char *out, size_t cap);
-
-static int capture_subcommand(const char *cmd, char *out, size_t cap)
-{
-    return execute_command_capture(cmd, out, cap);
-}
-
-static int expand_substitutions(const char *src, char *dst, size_t cap)
-{
-    size_t i = 0, len = 0;
-
-    if (!src || !dst || cap == 0)
-        return 0;
-
-    while (src[i]) {
-        if (src[i] == '\'' ) {
-            if (len + 1 >= cap)
-                return 0;
-
-            dst[len++] = src[i++];
-
-            while (src[i] && src[i] != '\'') {
-                if (len + 1 >= cap)
-                    return 0;
-
-                dst[len++] = src[i++];
-            }
-
-            if (src[i] == '\'') {
-                if (len + 1 >= cap)
-                    return 0;
-
-                dst[len++] = src[i++];
-            }
-
-            continue;
+    if (mode == MODE_PROCESS) {
+        void *m = mmap(NULL, sizeof(HistStore), PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) {
+            fprintf(stderr, "%s: shared history mmap failed: %s\n",
+                    APP_NAME, strerror(errno));
+            exit(1);
         }
-
-        if (src[i] == '\\' && src[i + 1]) {
-            if (len + 2 >= cap)
-                return 0;
-
-            dst[len++] = src[i++];
-            dst[len++] = src[i++];
-            continue;
-        }
-
-        if (src[i] == '$' && src[i + 1] == '(') {
-            size_t start = i + 2;
-            size_t end = start;
-            int depth = 1;
-            char quote = 0;
-
-            while (src[end] && depth > 0) {
-                if (src[end] == '\\' && quote != '\'' && src[end + 1]) {
-                    end += 2;
-                    continue;
-                }
-
-                if (quote == '\'') {
-                    if (src[end] == '\'')
-                        quote = 0;
-                    end++;
-                    continue;
-                }
-
-                if (src[end] == '\'' && quote == 0) {
-                    quote = '\'';
-                    end++;
-                    continue;
-                }
-
-                if (src[end] == '"' && quote == 0) {
-                    quote = '"';
-                    end++;
-                    continue;
-                }
-
-                if (src[end] == '"' && quote == '"') {
-                    quote = 0;
-                    end++;
-                    continue;
-                }
-
-                if (quote == 0 && src[end] == '(')
-                    depth++;
-                else if (quote == 0 && src[end] == ')')
-                    depth--;
-
-                end++;
-            }
-
-            if (depth != 0)
-                return 0;
-
-            size_t sub_len = end - start - 1;
-
-            if (sub_len >= MAX_CMD)
-                return 0;
-
-            char sub[MAX_CMD];
-            char result[MAX_EXPANDED_CMD];
-
-            memcpy(sub, src + start, sub_len);
-            sub[sub_len] = '\0';
-
-            if (!capture_subcommand(sub, result, sizeof(result)))
-                return 0;
-
-            size_t result_len = strlen(result);
-
-            if (result_len >= cap - len)
-                return 0;
-
-            memcpy(dst + len, result, result_len);
-            len += result_len;
-            i = end;
-            continue;
-        }
-
-        if (src[i] == '`') {
-            size_t start = i + 1;
-            size_t end = start;
-
-            while (src[end] && src[end] != '`') {
-                if (src[end] == '\\' && src[end + 1])
-                    end += 2;
-                else
-                    end++;
-            }
-
-            if (src[end] != '`')
-                return 0;
-
-            size_t sub_len = end - start;
-
-            if (sub_len >= MAX_CMD)
-                return 0;
-
-            char sub[MAX_CMD];
-            char result[MAX_EXPANDED_CMD];
-
-            memcpy(sub, src + start, sub_len);
-            sub[sub_len] = '\0';
-
-            if (!capture_subcommand(sub, result, sizeof(result)))
-                return 0;
-
-            size_t result_len = strlen(result);
-
-            if (result_len >= cap - len)
-                return 0;
-
-            memcpy(dst + len, result, result_len);
-            len += result_len;
-            i = end + 1;
-            continue;
-        }
-
-        if (len + 1 >= cap)
-            return 0;
-
-        dst[len++] = src[i++];
+        g_hist = m;
+        sem_init(&g_hist->sem, 1, 1);   /* process-shared */
+    } else {
+        g_hist = &g_hist_local;
+        sem_init(&g_hist->sem, 0, 1);   /* thread-shared  */
     }
+    g_hist->count = 0;
+    g_hist->head  = 0;
+}
 
-    dst[len] = '\0';
+static void history_add(const char *cmd)
+{
+    int idx;
+
+    if (!g_hist || !cmd || !*cmd)
+        return;
+
+    sem_wait(&g_hist->sem);
+
+    if (g_hist->count < HIST_MAX) {
+        idx = (g_hist->head + g_hist->count) % HIST_MAX;
+        g_hist->count++;
+    } else {
+        idx = g_hist->head;
+        g_hist->head = (g_hist->head + 1) % HIST_MAX;
+    }
+    snprintf(g_hist->entries[idx], HIST_ENTRY, "%s", cmd);
+
+    sem_post(&g_hist->sem);
+}
+
+static int history_count(void)
+{
+    int c;
+    if (!g_hist)
+        return 0;
+    sem_wait(&g_hist->sem);
+    c = g_hist->count;
+    sem_post(&g_hist->sem);
+    return c;
+}
+
+static int history_get(int i, char *buf, size_t cap)
+{
+    int ok = 0;
+    if (!g_hist || cap == 0)
+        return 0;
+    sem_wait(&g_hist->sem);
+    if (i >= 0 && i < g_hist->count) {
+        snprintf(buf, cap, "%s", g_hist->entries[(g_hist->head + i) % HIST_MAX]);
+        ok = 1;
+    }
+    sem_post(&g_hist->sem);
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* lexer / parser                                                     */
+/* ------------------------------------------------------------------ */
+
+static int apush(char c)
+{
+    if (g_arena_pos + 1 >= ARENA_SZ)
+        return 0;
+    g_arena[g_arena_pos++] = c;
     return 1;
 }
 
-static int run_builtin(char **args, int argc)
+static int astr(const char *s)
 {
-    if (argc == 0)
-        return 1;
+    while (s && *s) {
+        if (!apush(*s++))
+            return 0;
+    }
+    return 1;
+}
 
-    if (!strcmp(args[0], "cd")) {
-        const char *path = argc > 1 ? args[1] : getenv("HOME");
+static int match_paren(const char *s, int open)
+{
+    int depth = 0, i = open;
+    char q = 0;
 
-        if (!path) {
-            add_line("terminator: cd: HOME not set");
-            last_status = 1;
-        } else if (chdir(path) == -1) {
-            char msg[CMD_SIZE];
-            snprintf(msg, sizeof(msg), "cd: %s", strerror(errno));
-            add_line(msg);
-            last_status = 1;
-        } else {
-            last_status = 0;
+    for (; s[i]; i++) {
+        char c = s[i];
+        if (q == '\'') {
+            if (c == '\'') q = 0;
+            continue;
+        }
+        if (q == '"') {
+            if (c == '\\' && s[i + 1]) { i++; continue; }
+            if (c == '"') q = 0;
+            continue;
+        }
+        if (c == '\'') { q = '\''; continue; }
+        if (c == '"')  { q = '"';  continue; }
+        if (c == '\\' && s[i + 1]) { i++; continue; }
+        if (c == '(') depth++;
+        else if (c == ')') { depth--; if (depth == 0) return i; }
+    }
+    return -1;
+}
+
+static int match_backtick(const char *s, int open)
+{
+    int i;
+    for (i = open + 1; s[i]; i++) {
+        if (s[i] == '\\' && s[i + 1]) { i++; continue; }
+        if (s[i] == '`') return i;
+    }
+    return -1;
+}
+
+/* run a command substitution; result has trailing newlines stripped */
+static int cmd_substitute(const char *cmd, char *out, size_t cap)
+{
+    return run_capture(cmd, out, cap);
+}
+
+static int push_subst(const char *inner)
+{
+    char buf[MAX_EXPANDED];
+    size_t len;
+
+    if (!cmd_substitute(inner, buf, sizeof buf))
+        return 0;
+
+    len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+        buf[--len] = '\0';
+
+    /* split on whitespace like bash word-splitting would inside quotes it
+     * does not, but the caller decides; here we keep it verbatim */
+    return astr(buf);
+}
+
+/* expand a $... reference starting at s[i]=='$'; returns new index */
+static int expand_dollar(const char *s, int i)
+{
+    i++;                               /* past '$' */
+
+    if (s[i] == '?') {
+        char n[16];
+        snprintf(n, sizeof n, "%d", g_last_status);
+        astr(n);
+        return i + 1;
+    }
+    if (s[i] == '$') {
+        char n[16];
+        snprintf(n, sizeof n, "%d", (int)getpid());
+        astr(n);
+        return i + 1;
+    }
+    if (s[i] == '#') {
+        return i + 1;                  /* no positional params */
+    }
+    if (s[i] == '(') {                 /* $(...) */
+        int close = match_paren(s, i);
+        char inner[MAX_EXPANDED];
+        size_t L;
+        if (close < 0)
+            return -1;
+        L = (size_t)(close - i - 1);
+        if (L >= sizeof inner)
+            L = sizeof inner - 1;
+        memcpy(inner, s + i + 1, L);
+        inner[L] = '\0';
+        if (!push_subst(inner))
+            return -1;
+        return close + 1;
+    }
+    if (s[i] == '{') {                 /* ${name} */
+        int j = i + 1;
+        char name[256];
+        int k = 0;
+        while (s[j] && s[j] != '}' && k < (int)sizeof name - 1)
+            name[k++] = s[j++];
+        name[k] = '\0';
+        if (s[j] == '}') {
+            const char *v = getenv(name);
+            astr(v ? v : "");
+            return j + 1;
+        }
+        /* unterminated -> literal */
+        apush('$');
+        apush('{');
+        astr(name);
+        return j;
+    }
+    if (isalpha((unsigned char)s[i]) || s[i] == '_') {
+        char name[256];
+        int k = 0;
+        while ((isalnum((unsigned char)s[i]) || s[i] == '_') &&
+               k < (int)sizeof name - 1)
+            name[k++] = s[i++];
+        name[k] = '\0';
+        {
+            const char *v = getenv(name);
+            astr(v ? v : "");
+        }
+        return i;
+    }
+    apush('$');
+    return i;
+}
+
+static int word_end(char c)
+{
+    return c == '\0' || isspace((unsigned char)c) ||
+           c == '|' || c == '&' || c == ';' || c == '<' || c == '>';
+}
+
+static int lex_core(const char *src, Token *toks, int max, char *err,
+                    size_t errcap, int reset)
+{
+    int nt = 0;
+    int i = 0;
+
+    if (reset)
+        g_arena_pos = 0;
+
+    while (src[i]) {
+        /* skip separators */
+        while (src[i] &&
+               (isspace((unsigned char)src[i]) ||
+                (src[i] == '\\' && src[i + 1] == '\n')))
+            i++;
+        if (!src[i])
+            break;
+
+        if (nt >= max) {
+            if (err) snprintf(err, errcap, "too many tokens");
+            return -1;
         }
 
-        return 1;
-    }
+        /* operators */
+        {
+            const char *op = NULL;
+            int olen = 0;
 
-    if (!strcmp(args[0], "exit")) {
-        if (argc > 1)
-            last_status = atoi(args[1]);
-        shell_running = 0;
-        return 1;
-    }
+            if (src[i] == '|' && src[i + 1] == '|') { op = "||"; olen = 2; }
+            else if (src[i] == '&' && src[i + 1] == '&') { op = "&&"; olen = 2; }
+            else if (src[i] == '|') { op = "|"; olen = 1; }
+            else if (src[i] == ';') { op = ";"; olen = 1; }
+            else if (src[i] == '&') { op = "&"; olen = 1; }
+            else if (src[i] == '<' && src[i + 1] == '<') { op = "<<"; olen = 2; }
+            else if (src[i] == '<') { op = "<"; olen = 1; }
+            else if (src[i] == '>' && src[i + 1] == '>') { op = ">>"; olen = 2; }
+            else if (src[i] == '>') { op = ">"; olen = 1; }
+            else if (src[i] == '2' && src[i + 1] == '>' && src[i + 2] == '>') { op = "2>>"; olen = 3; }
+            else if (src[i] == '2' && src[i + 1] == '>') { op = "2>"; olen = 2; }
 
-    if (!strcmp(args[0], "history")) {
-        for (int i = 0; i < cmd_history_count; i++) {
-            char msg[CMD_SIZE + 32];
-            snprintf(msg, sizeof(msg), "%5d  %s",
-                     i + 1, cmd_history[i]);
-            add_line(msg);
+            if (op) {
+                size_t st = g_arena_pos;
+                astr(op);
+                apush('\0');
+                toks[nt].text = &g_arena[st];
+                toks[nt].quoted = 0;
+                toks[nt].has_glob = 0;
+                toks[nt].is_op = 1;
+                nt++;
+                i += olen;
+                continue;
+            }
         }
 
-        last_status = 0;
-        return 1;
+        /* a word */
+        {
+            size_t st = g_arena_pos;
+            int quoted = 0, glob = 0;
+            char q = 0;
+
+            while (src[i] && !(q == 0 && word_end(src[i]))) {
+                char c = src[i];
+
+                if (q == '\'') {
+                    if (c == '\'') { q = 0; i++; }
+                    else { apush(c); i++; }
+                    continue;
+                }
+                if (q == '"') {
+                    if (c == '"') { q = 0; i++; continue; }
+                    if (c == '\\') {
+                        char nx = src[i + 1];
+                        if (nx == '$' || nx == '`' || nx == '"' || nx == '\\') {
+                            apush(nx); i += 2;
+                        } else if (nx == '\n') {
+                            i += 2;            /* line continuation */
+                        } else {
+                            apush('\\'); i++;
+                        }
+                        quoted = 1;
+                        continue;
+                    }
+                    if (c == '$') {
+                        int r = expand_dollar(src, i);
+                        if (r < 0) goto fail;
+                        i = r; quoted = 1; continue;
+                    }
+                    if (c == '`') {
+                        int close = match_backtick(src, i);
+                        char inner[MAX_EXPANDED];
+                        size_t L;
+                        if (close < 0) goto fail;
+                        L = (size_t)(close - i - 1);
+                        if (L >= sizeof inner) L = sizeof inner - 1;
+                        memcpy(inner, src + i + 1, L);
+                        inner[L] = '\0';
+                        if (!push_subst(inner)) goto fail;
+                        i = close + 1; quoted = 1; continue;
+                    }
+                    apush(c); i++; continue;
+                }
+
+                /* unquoted */
+                if (c == '\'') { q = '\''; quoted = 1; i++; continue; }
+                if (c == '"')  { q = '"';  quoted = 1; i++; continue; }
+                if (c == '\\') {
+                    char nx = src[i + 1];
+                    if (nx == '\0') { i++; continue; }
+                    if (nx == '\n') { i += 2; continue; }  /* continuation */
+                    apush(nx); i += 2; quoted = 1; continue;
+                }
+                if (c == '$') {
+                    int r = expand_dollar(src, i);
+                    if (r < 0) goto fail;
+                    i = r; quoted = 1; continue;
+                }
+                if (c == '`') {
+                    int close = match_backtick(src, i);
+                    char inner[MAX_EXPANDED];
+                    size_t L;
+                    if (close < 0) goto fail;
+                    L = (size_t)(close - i - 1);
+                    if (L >= sizeof inner) L = sizeof inner - 1;
+                    memcpy(inner, src + i + 1, L);
+                    inner[L] = '\0';
+                    if (!push_subst(inner)) goto fail;
+                    i = close + 1; quoted = 1; continue;
+                }
+                if (c == '*' || c == '?' || c == '[')
+                    glob = 1;
+                apush(c); i++;
+            }
+
+            if (q != 0) {
+                if (err) snprintf(err, errcap, "unmatched quote");
+                return -1;
+            }
+
+            apush('\0');
+            toks[nt].text = &g_arena[st];
+            toks[nt].quoted = quoted;
+            toks[nt].has_glob = glob;
+            toks[nt].is_op = 0;
+            nt++;
+        }
+        continue;
+fail:
+        if (err) snprintf(err, errcap, "syntax error");
+        return -1;
     }
 
+    return nt;
+}
+
+static int lex(const char *src, Token *toks, int max, char *err, size_t errcap)
+{
+    return lex_core(src, toks, max, err, errcap, 1);
+}
+
+static int is_list_op(const Token *t)
+{
+    return t->is_op &&
+           (!strcmp(t->text, "&&") || !strcmp(t->text, "||") || !strcmp(t->text, ";"));
+}
+
+static int is_redir_op(const Token *t)
+{
+    return t->is_op &&
+           (!strcmp(t->text, "<") || !strcmp(t->text, ">") ||
+            !strcmp(t->text, ">>") || !strcmp(t->text, "2>") ||
+            !strcmp(t->text, "2>>"));
+}
+
+static int command_incomplete(const char *s)
+{
+    int i = 0;
+    char q = 0;
+    int paren = 0, btick = 0;
+    int last_nonblank = -1;
+
+    for (i = 0; s[i]; i++) {
+        char c = s[i];
+        if (!isspace((unsigned char)c))
+            last_nonblank = i;
+
+        if (q == '\'') {
+            if (c == '\'') q = 0;
+            continue;
+        }
+        if (q == '"') {
+            if (c == '\\' && s[i + 1]) { i++; continue; }
+            if (c == '"') q = 0;
+            continue;
+        }
+        if (c == '\\') {
+            if (s[i + 1] == '\0')
+                return 1;                 /* trailing backslash */
+            i++;
+            continue;
+        }
+        if (c == '\'') { q = '\''; continue; }
+        if (c == '"')  { q = '"';  continue; }
+        if (c == '$' && s[i + 1] == '(') { paren++; i++; continue; }
+        if (c == '(' && paren > 0) { paren++; continue; }
+        if (c == ')' && paren > 0) { paren--; continue; }
+        if (c == '`') { btick = !btick; continue; }
+    }
+
+    if (q != 0 || paren > 0 || btick)
+        return 1;
+
+    if (last_nonblank >= 0) {
+        char c = s[last_nonblank];
+        if (c == '|')
+            return 1;
+        if (c == '&' && last_nonblank > 0 && s[last_nonblank - 1] == '&')
+            return 1;
+    }
     return 0;
 }
 
-/*
- * Tokenizer:
- * - Handles single and double quotes.
- * - Handles backslash escapes outside single quotes.
- * - Recognizes |, <, >, >>, 2>, 2>> and &.
- * - Operators are returned as separate tokens.
- */
-static int tokenize(char *src, char *tokens[], int max_tokens)
+static int parse_stages(Token *toks, int nt, Stage *st, int *nst)
 {
-    char *r = src;
-    char *w = expanded_cmd;
-    int count = 0;
+    int s = 0, i;
 
-    while (*r) {
-        while (isspace((unsigned char)*r))
-            r++;
+    memset(st, 0, sizeof(Stage) * MAX_STAGES);
+    *nst = 1;
 
-        if (!*r)
-            break;
+    for (i = 0; i < nt; i++) {
+        Token *t = &toks[i];
 
-        if (count >= max_tokens - 1)
-            return -1;
+        if (is_list_op(t))
+            return 0;                  /* caller must split on these first */
 
-        if (*r == '2' && r[1] == '>') {
-            tokens[count++] = r[2] == '>' ? "2>>" : "2>";
-            r += r[2] == '>' ? 3 : 2;
-            continue;
-        }
-
-        if (*r == '|') {
-            tokens[count++] = "|";
-            r++;
-            continue;
-        }
-
-        if (*r == '<') {
-            tokens[count++] = "<";
-            r++;
-            continue;
-        }
-
-        if (*r == '>') {
-            tokens[count++] = r[1] == '>' ? ">>" : ">";
-            r += r[1] == '>' ? 2 : 1;
-            continue;
-        }
-
-        if (*r == '&') {
-            tokens[count++] = "&";
-            r++;
-            continue;
-        }
-
-        tokens[count] = w;
-	token_quoted[count] = 0;
-	count++;
-        char quote = 0;
-
-        while (*r) {
-            if (!quote && (isspace((unsigned char)*r) ||
-                *r == '|' || *r == '<' || *r == '>' ||
-                *r == '&'))
-                break;
-
-            if (!quote && (*r == '\'' || *r == '"')) {
-            	token_quoted[count - 1] = 1;
-                quote = *r++;
-                continue;
-            }
-
-            if (quote && *r == quote) {
-                quote = 0;
-                r++;
-                continue;
-            }
-
-            if (*r == '\\' && quote != '\'' && r[1]) {
-	    if (quote == '"') {
-		if (r[1] == '$' || r[1] == '`' ||
-		        r[1] == '"' || r[1] == '\\') {
-		        r++;
-		        append_char(&w, *r++);
-		    } else {
-		        append_char(&w, *r++);
-		        append_char(&w, *r++);
-		    }
-	        } else {
-		    r++;
-		    append_char(&w, *r++);
-	       }
-	        continue;
-	    }
-
-            if (*r == '$' && quote != '\'') {
-                r++;
-
-                if (*r == '?') {
-                    char value[32];
-                    snprintf(value, sizeof(value), "%d", last_status);
-                    append_text(&w, value);
-                    r++;
-                    continue;
-                }
-
-                char name[256];
-                int j = 0;
-
-                if (*r == '{') {
-                    r++;
-
-                    while (*r && *r != '}' &&
-                           j < (int)sizeof(name) - 1)
-                        name[j++] = *r++;
-
-                    if (*r == '}')
-                        r++;
-                    else {
-                        append_char(&w, '$');
-                        append_char(&w, '{');
-                        name[j] = '\0';
-                        append_text(&w, name);
-                        continue;
-                    }
-                } else {
-                    while ((*r == '_' ||
-                           (*r >= 'a' && *r <= 'z') ||
-                           (*r >= 'A' && *r <= 'Z') ||
-                           (*r >= '0' && *r <= '9')) &&
-                           j < (int)sizeof(name) - 1)
-                        name[j++] = *r++;
-                }
-
-                if (j == 0) {
-                    append_char(&w, '$');
-                    continue;
-                }
-
-                name[j] = '\0';
-                append_text(&w, getenv(name));
-                continue;
-            }
-
-            append_char(&w, *r++);
-        }
-
-        if (quote) {
-            add_line("terminator: unmatched quote");
-            return -1;
-        }
-
-        append_char(&w, '\0');
-    }
-
-    tokens[count] = NULL;
-    return count;
-}
-
-
-static int is_operator(const char *s)
-{
-    return !strcmp(s, "|") || !strcmp(s, "<") ||
-           !strcmp(s, ">") || !strcmp(s, ">>") ||
-           !strcmp(s, "2>") || !strcmp(s, "2>>") ||
-           !strcmp(s, "&");
-}
-
-static int parse_pipeline(char *tokens[], int nt,
-                          Stage stages[], int *nstages)
-{
-    int s = 0;
-
-    memset(stages, 0, sizeof(Stage) * MAX_STAGES);
-    *nstages = 1;
-
-    for (int i = 0; i < nt; i++) {
-        Stage *st = &stages[s];
-
-        if (!strcmp(tokens[i], "|")) {
-            if (st->argc == 0 || s + 1 >= MAX_STAGES) {
-                add_line("terminator: invalid pipeline");
+        if (t->is_op && !strcmp(t->text, "|")) {
+            if (st[s].argc == 0)
                 return 0;
-            }
-
+            if (s + 1 >= MAX_STAGES)
+                return 0;
             s++;
-            (*nstages)++;
+            (*nst)++;
             continue;
         }
 
-        if (!strcmp(tokens[i], "&")) {
-            if (i != nt - 1) {
-                add_line("terminator: unexpected &");
-                return 0;
-            }
-
-            st->background = 1;
+        if (t->is_op && !strcmp(t->text, "&")) {
+            st[s].background = 1;
             continue;
         }
 
-        if (!strcmp(tokens[i], "<") ||
-            !strcmp(tokens[i], ">") ||
-            !strcmp(tokens[i], ">>") ||
-            !strcmp(tokens[i], "2>") ||
-            !strcmp(tokens[i], "2>>")) {
-
-            char *op = tokens[i];
-
-            if (++i >= nt || is_operator(tokens[i])) {
-                add_line("terminator: missing redirection filename");
+        if (is_redir_op(t)) {
+            if (++i >= nt || toks[i].is_op)
                 return 0;
-            }
-
-            if (!strcmp(op, "<"))
-                st->input = tokens[i];
-            else if (!strcmp(op, ">") || !strcmp(op, ">>")) {
-                st->output = tokens[i];
-                st->append = !strcmp(op, ">>");
+            if (!strcmp(t->text, "<"))
+                st[s].input = toks[i].text;
+            else if (!strcmp(t->text, ">")) {
+                st[s].output = toks[i].text; st[s].append_out = 0;
+            } else if (!strcmp(t->text, ">>")) {
+                st[s].output = toks[i].text; st[s].append_out = 1;
+            } else if (!strcmp(t->text, "2>")) {
+                st[s].error = toks[i].text; st[s].append_err = 0;
             } else {
-                st->error = tokens[i];
-
-                if (!strcmp(op, "2>>"))
-                    st->append = 1;
+                st[s].error = toks[i].text; st[s].append_err = 1;
             }
-
             continue;
         }
 
-        if (st->argc >= MAX_ARGS - 1) {
-            add_line("terminator: too many arguments");
+        if (st[s].argc >= MAX_ARGS - 1)
             return 0;
-        }
 
-        st->args[st->argc] = tokens[i];
-	st->glob_allowed[st->argc] = !token_quoted[i];
-	st->argc++;
+        st[s].args[st[s].argc] = t->text;
+        st[s].has_glob[st[s].argc] = t->has_glob;
+        st[s].argc++;
     }
 
-    for (int i = 0; i < *nstages; i++) {
-        if (stages[i].argc == 0) {
-            add_line("terminator: empty pipeline stage");
+    for (i = 0; i < *nst; i++) {
+        if (st[i].argc == 0)
             return 0;
-        }
-
-        stages[i].args[stages[i].argc] = NULL;
+        st[i].args[st[i].argc] = NULL;
     }
 
     return 1;
 }
 
-/* Expand wildcard arguments without using a shell. */
+/* ------------------------------------------------------------------ */
+/* executor                                                           */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    volatile pid_t fg_pgid;
+    volatile pid_t mw_pgid;
+    volatile int   mw_active;
+    volatile int   mw_cancel;
+} Shared;
+
+static Shared *g_sh_self = NULL;      /* this worker's shared control block */
+
+static void free_stage_args(Stage *st, int n)
+{
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < st[i].argc; j++)
+            free(st[i].args[j]);
+}
+
 static void expand_globs(Stage *st)
 {
-    char *expanded[MAX_ARGS];
-    int n = 0;
-    
-    for (int i = 0; i < st->argc; i++) {
-        glob_t g;
-        memset(&g, 0, sizeof(g));
-        
-        if (!st->glob_allowed[i]) {
-            expanded[n++] = strdup(st->args[i]);
-            continue;
-        }
+    char *na[MAX_ARGS];
+    int n = 0, i;
 
-        int rc = glob(st->args[i], 0, NULL, &g);
-
-        if (rc == 0) {
-            for (size_t j = 0; j < g.gl_pathc &&
-                 n < MAX_ARGS - 1; j++)
-                expanded[n++] = strdup(g.gl_pathv[j]);
+    for (i = 0; i < st->argc; i++) {
+        if (st->has_glob[i]) {
+            glob_t g;
+            memset(&g, 0, sizeof g);
+            if (glob_in_cwd(st->args[i], &g) == 0) {
+                for (size_t j = 0; j < g.gl_pathc && n < MAX_ARGS - 1; j++)
+                    na[n++] = xstrdup(g.gl_pathv[j]);
+            } else {
+                if (n < MAX_ARGS - 1)
+                    na[n++] = xstrdup(st->args[i]);
+            }
+            globfree(&g);
         } else {
             if (n < MAX_ARGS - 1)
-                expanded[n++] = strdup(st->args[i]);
+                na[n++] = xstrdup(st->args[i]);
         }
-
-        globfree(&g);
     }
-
-    for (int i = 0; i < n; i++)
-        st->args[i] = expanded[i];
-
+    for (i = 0; i < n; i++)
+        st->args[i] = na[i];
     st->argc = n;
     st->args[n] = NULL;
 }
@@ -618,627 +898,2489 @@ static int open_redirections(Stage *st)
 
     if (st->input) {
         fd = open(st->input, O_RDONLY);
-
-        if (fd == -1) {
-            dprintf(STDERR_FILENO, "%s: %s\n",
-                    st->input, strerror(errno));
+        if (fd < 0) {
+            dprintf(STDERR_FILENO, "%s: %s: %s\n", APP_NAME, st->input,
+                    strerror(errno));
             return 0;
         }
-
-        if (dup2(fd, STDIN_FILENO) == -1) {
-            close(fd);
-            return 0;
-        }
-
+        if (dup2(fd, STDIN_FILENO) < 0) { close(fd); return 0; }
         close(fd);
     }
-
     if (st->output) {
-        int flags = O_WRONLY | O_CREAT |
-                    (st->append ? O_APPEND : O_TRUNC);
-
-        fd = open(st->output, flags, 0666);
-
-        if (fd == -1) {
-            dprintf(STDERR_FILENO, "%s: %s\n",
-                    st->output, strerror(errno));
+        int fl = O_WRONLY | O_CREAT | (st->append_out ? O_APPEND : O_TRUNC);
+        fd = open(st->output, fl, 0666);
+        if (fd < 0) {
+            dprintf(STDERR_FILENO, "%s: %s: %s\n", APP_NAME, st->output,
+                    strerror(errno));
             return 0;
         }
-
-        if (dup2(fd, STDOUT_FILENO) == -1) {
-            close(fd);
-            return 0;
-        }
-
+        if (dup2(fd, STDOUT_FILENO) < 0) { close(fd); return 0; }
         close(fd);
     }
-
     if (st->error) {
-        int flags = O_WRONLY | O_CREAT |
-                    (st->append ? O_APPEND : O_TRUNC);
-
-        fd = open(st->error, flags, 0666);
-
-        if (fd == -1) {
-            dprintf(STDERR_FILENO, "%s: %s\n",
-                    st->error, strerror(errno));
+        int fl = O_WRONLY | O_CREAT | (st->append_err ? O_APPEND : O_TRUNC);
+        fd = open(st->error, fl, 0666);
+        if (fd < 0) {
+            dprintf(STDERR_FILENO, "%s: %s: %s\n", APP_NAME, st->error,
+                    strerror(errno));
             return 0;
         }
-
-        if (dup2(fd, STDERR_FILENO) == -1) {
-            close(fd);
-            return 0;
-        }
-
+        if (dup2(fd, STDERR_FILENO) < 0) { close(fd); return 0; }
         close(fd);
     }
-
     return 1;
 }
 
-
-static void child_exec(Stage *st, int input_fd, int output_fd,
-                       int capture_fd, int capture_stderr, int pipes[][2], int npipes)
+static void child_exec(Stage *st, int in_fd, int out_fd, int term_out, pid_t pgid,
+                       const char *e_notfound, const char *e_noperm, const char *e_cannot)
 {
-    if (input_fd != -1 && dup2(input_fd, STDIN_FILENO) == -1)
-        _exit(126);
+    /* own process group so the GUI can signal the whole job */
+    setpgid(0, pgid);
 
-    if (output_fd != -1) {
-        if (dup2(output_fd, STDOUT_FILENO) == -1)
+    /* every child runs in this tab's logical working directory */
+    if (g_cwd[0])
+        chdir(g_cwd);
+
+    if (in_fd >= 0 && dup2(in_fd, STDIN_FILENO) < 0)
+        _exit(126);
+    if (out_fd >= 0) {
+        if (dup2(out_fd, STDOUT_FILENO) < 0)
             _exit(126);
-    } else if (capture_fd != -1) {
-        if (dup2(capture_fd, STDOUT_FILENO) == -1)
+    } else if (term_out) {
+        if (dup2(g_out_fd, STDOUT_FILENO) < 0)
             _exit(126);
     }
-
-   if (capture_fd != -1 && capture_stderr && 
-        dup2(capture_fd, STDERR_FILENO) == -1)
+    if (term_out && dup2(g_out_fd, STDERR_FILENO) < 0)
         _exit(126);
 
-    for (int i = 0; i < npipes; i++) {
-        close(pipes[i][0]);
-        close(pipes[i][1]);
-    }
-
-    if (input_fd != -1 && input_fd != STDIN_FILENO)
-        close(input_fd);
-
-    if (output_fd != -1 && output_fd != STDOUT_FILENO)
-        close(output_fd);
-
-    if (capture_fd != -1 &&
-        capture_fd != STDOUT_FILENO &&
-        capture_fd != STDERR_FILENO)
-        close(capture_fd);
+    /* restore default signal dispositions for the child */
+    signal(SIGINT, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL);
+    signal(SIGPIPE, SIG_DFL);
+    signal(SIGTSTP, SIG_DFL);
 
     if (!open_redirections(st))
         _exit(1);
 
+    /* builtins that must still work in a child (pipeline / redirection) */
     if (!strcmp(st->args[0], "cd")) {
-        const char *path = st->argc > 1
-                         ? st->args[1] : getenv("HOME");
-
-        if (!path || chdir(path) == -1) {
-            dprintf(STDERR_FILENO, "cd: %s\n", strerror(errno));
+        const char *p = st->argc > 1 ? st->args[1] : getenv("HOME");
+        if (!p || chdir(p) < 0) {
+            dprintf(STDERR_FILENO, "%s: cd: %s\n", APP_NAME,
+                    p ? strerror(errno) : "HOME not set");
             _exit(1);
         }
-
         _exit(0);
     }
-
+    if (!strcmp(st->args[0], "pwd")) {
+        char b[PATH_MAX];
+        if (getcwd(b, sizeof b))
+            dprintf(STDOUT_FILENO, "%s\n", b);
+        _exit(0);
+    }
+    if (!strcmp(st->args[0], "export")) {
+        for (int i = 1; i < st->argc; i++) {
+            char *eq = strchr(st->args[i], '=');
+            if (eq) { *eq = '\0'; setenv(st->args[i], eq + 1, 1); *eq = '='; }
+        }
+        _exit(0);
+    }
     if (!strcmp(st->args[0], "history")) {
-        for (int i = 0; i < cmd_history_count; i++)
-            dprintf(STDOUT_FILENO, "%5d  %s\n",
-                    i + 1, cmd_history[i]);
-
+        char b[HIST_ENTRY];
+        for (int i = 0; i < history_count(); i++)
+            if (history_get(i, b, sizeof b))
+                dprintf(STDOUT_FILENO, "%5d  %s\n", i + 1, b);
         _exit(0);
     }
+    if (!strcmp(st->args[0], "exit"))
+        _exit(st->argc > 1 ? atoi(st->args[1]) : g_last_status);
 
     execvp(st->args[0], st->args);
 
-    dprintf(STDERR_FILENO, "%s: %s\n",
-            st->args[0], strerror(errno));
-    _exit(errno == ENOENT ? 127 : 126);
+    {
+        int e = errno;
+        if (e == ENOENT)
+            dprintf(STDERR_FILENO, "%s: %s: command not found\n", e_notfound,
+                    st->args[0]);
+        else if (e == EACCES)
+            dprintf(STDERR_FILENO, "%s: %s: %s\n", e_noperm, st->args[0],
+                    strerror(e));
+        else
+            dprintf(STDERR_FILENO, "%s: %s: %s\n", e_cannot, st->args[0],
+                    strerror(e));
+        _exit(e == ENOENT ? 127 : 126);
+    }
 }
 
-
-static void execute_pipeline(Stage stages[], int n, char *result, size_t result_cap)
+static void wait_foreground(pid_t *pids, int n)
 {
-    int pipes[MAX_STAGES - 1][2];
-    pid_t pids[MAX_STAGES];
-    int capture[2];
-    int npipes = n - 1;
-    int background = stages[n - 1].background;
-    int status = 0;
-    
-    if (result != NULL) {
-        if (result_cap == 0)
-            return;
+    int i, st;
 
-        result[0] = '\0';
-    }
-
-    /*
-     * A single command with no redirections can run a stateful
-     * built-in directly in the parent shell.
-     */
-    if (result == NULL && n == 1 && !stages[0].input &&
-        !stages[0].output && !stages[0].error &&
-        !background && run_builtin(stages[0].args,
-                                   stages[0].argc))
-        return;
-
-    for (int i = 0; i < n; i++)
-        expand_globs(&stages[i]);
-
-    for (int i = 0; i < npipes; i++) {
-        if (pipe(pipes[i]) == -1) {
-            add_line("terminator: pipe failed");
-            last_status = 1;
-
-            for (int j = 0; j < i; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-
-            return;
-        }
-    }
-
-    if (pipe(capture) == -1) {
-        add_line("terminator: output capture pipe failed");
-
-        for (int i = 0; i < npipes; i++) {
-            close(pipes[i][0]);
-            close(pipes[i][1]);
-        }
-
-        last_status = 1;
-        return;
-    }
-
-    for (int i = 0; i < n; i++) {
-        pid_t pid = fork();
-
-        if (pid == -1) {
-            add_line("terminator: fork failed");
-            last_status = 1;
-
-            for (int j = 0; j < npipes; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-
-            close(capture[0]);
-            close(capture[1]);
-
-            for (int j = 0; j < i; j++)
-                kill(pids[j], SIGTERM);
-
-            for (int j = 0; j < i; j++)
-                while (waitpid(pids[j], NULL, 0) == -1 &&
-                       errno == EINTR) {}
-
-            return;
-        }
-
-        
-	if (pid == 0) {
-	    int in = i > 0 ? pipes[i - 1][0] : -1;
-	    int out = i < n - 1 ? pipes[i][1] : -1;
-	    int cap = i == n - 1 ? capture[1] : -1;
-
-	    close(capture[0]);
-
-	    if (cap == -1)
-		close(capture[1]);
-
-	    child_exec(&stages[i], in, out, cap, result == NULL, pipes, npipes);
-	}
-
-    }
-
-    for (int i = 0; i < npipes; i++) {
-        close(pipes[i][0]);
-        close(pipes[i][1]);
-    }
-
-    close(capture[1]);
-
-    if (background) {
-        close(capture[0]);
-
-        char msg[128];
-        snprintf(msg, sizeof(msg), "[background] PID %ld",
-                 (long)pids[n - 1]);
-        add_line(msg);
-
-        last_status = 0;
-        return;
-    }
-
-    /*
-     * Read output before waiting: otherwise a child producing
-     * lots of output could block on a full capture pipe.
-     */
-	    if (result != NULL) {
-	    size_t len = 0;
-	    int too_long = 0;
-	    char buf[512];
-
-	    while (1) {
-		ssize_t nr = read(capture[0], buf, sizeof(buf));
-
-		if (nr == 0)
-		    break;
-
-		if (nr < 0) {
-		    if (errno == EINTR)
-		        continue;
-
-		    break;
-		}
-
-		size_t take = (size_t)nr;
-
-		if (take >= result_cap - len) {
-		    too_long = 1;
-		    continue;
-		}
-
-		memcpy(result + len, buf, take);
-		len += take;
-		result[len] = '\0';
-	    }
-
-	    close(capture[0]);
-
-	    if (too_long) {
-		result[0] = '\0';
-		last_status = 1;
-	    } else {
-		while (len > 0 && result[len - 1] == '\n')
-		    result[--len] = '\0';
-	    }
-	} else {
-	    FILE *fp = fdopen(capture[0], "r");
-
-	    if (fp != NULL) {
-		char line[MAX_LINE_LEN];
-
-		while (fgets(line, sizeof(line), fp))
-		    add_line(line);
-
-		fclose(fp);
-	    } else {
-		close(capture[0]);
-	    }
-	}
-
-    for (int i = 0; i < n; i++) {
-        while (waitpid(pids[i], &status, 0) == -1) {
+    for (i = 0; i < n; i++) {
+        while (waitpid(pids[i], &st, 0) < 0) {
             if (errno == EINTR)
                 continue;
-
-            status = -1;
+            st = -1;
             break;
         }
-
         if (i == n - 1) {
-            if (status != -1 && WIFEXITED(status))
-                last_status = WEXITSTATUS(status);
-            else if (status != -1 && WIFSIGNALED(status))
-                last_status = 128 + WTERMSIG(status);
+            if (st != -1 && WIFEXITED(st))
+                g_last_status = WEXITSTATUS(st);
+            else if (st != -1 && WIFSIGNALED(st))
+                g_last_status = 128 + WTERMSIG(st);
             else
-                last_status = 1;
+                g_last_status = 1;
         }
     }
 }
 
-
-static int execute_command_capture(const char *cmd, char *out, size_t cap)
+static void reap_background_jobs(void)
 {
-    char copy[MAX_EXPANDED_CMD];
-    char expanded[MAX_EXPANDED_CMD];
-    char *tokens[MAX_ARGS * 2];
-    Stage stages[MAX_STAGES];
-    int nt, nstages;
+    int j, k;
 
-    if (!cmd || !out || cap == 0)
-        return 0;
+    for (j = 0; j < g_job_count; j++) {
+        Job *jb = &g_jobs[j];
+        if (jb->state != 0)
+            continue;
 
-    out[0] = '\0';
+        int all_done = 1;
+        for (k = 0; k < jb->npids; k++) {
+            int st;
+            pid_t r = waitpid(jb->pids[k], &st, WNOHANG);
+            if (r == 0)
+                all_done = 0;
+        }
+        if (all_done) {
+            jb->state = 1;
+            emit("[%d] done  %s\n", jb->id, jb->cmd);
+        }
+    }
+}
 
-    if (strlen(cmd) >= MAX_CMD)
-        return 0;
+/*
+ * Run a pipeline.  If term_out is set the final stage's stdout/stderr is
+ * captured and handed to the tab.  If result is non-NULL the captured text
+ * is returned there (used by command substitution).
+ */
+static int run_pipeline(Stage *st, int n, int term_out, char *result, size_t cap)
+{
+    int pipes[MAX_STAGES][2];
+    pid_t pids[MAX_STAGES];
+    int capture[2] = { -1, -1 };
+    int npipes = n - 1;
+    int background = st[n - 1].background;
+    int i;
 
-    if (!expand_substitutions(cmd, expanded, sizeof(expanded)))
-        return 0;
+    if (result)
+        result[0] = '\0';
 
-    memcpy(copy, expanded, strlen(expanded) + 1);
+    for (i = 0; i < n; i++)
+        expand_globs(&st[i]);
 
-    nt = tokenize(copy, tokens, MAX_ARGS * 2);
+    /* single, unadorned builtin runs in the worker itself so that it can
+     * change the shell's own state (cwd, history, jobs, ...) */
+    if (result == NULL && !background && n == 1 && !st[0].input &&
+        !st[0].output && !st[0].error && is_builtin(st[0].args[0])) {
+        int r = run_builtin_parent(st[0].args, st[0].argc);
+        free_stage_args(st, n);
+        return r;
+    }
 
-    if (nt <= 0)
-        return nt == 0;
+    if (background)
+        term_out = 0;
 
-    if (!parse_pipeline(tokens, nt, stages, &nstages))
-        return 0;
+    for (i = 0; i < npipes; i++) {
+        if (pipe(pipes[i]) < 0) {
+            emit("%s: pipe: %s\n", APP_NAME, strerror(errno));
+            g_last_status = 1;
+            for (int j = 0; j < i; j++) { close(pipes[j][0]); close(pipes[j][1]); }
+            free_stage_args(st, n);
+            return 0;
+        }
+    }
 
-    execute_pipeline(stages, nstages, out, cap);
+    if (term_out) {
+        if (pipe(capture) < 0) {
+            emit("%s: pipe: %s\n", APP_NAME, strerror(errno));
+            for (i = 0; i < npipes; i++) { close(pipes[i][0]); close(pipes[i][1]); }
+            g_last_status = 1;
+            free_stage_args(st, n);
+            return 0;
+        }
+    }
 
+    for (i = 0; i < n; i++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            emit("%s: fork: %s\n", APP_NAME, strerror(errno));
+            for (int j = 0; j < npipes; j++) { close(pipes[j][0]); close(pipes[j][1]); }
+            if (term_out) { close(capture[0]); close(capture[1]); }
+            for (int j = 0; j < i; j++) {
+                kill(pids[j], SIGKILL);
+                waitpid(pids[j], NULL, 0);
+            }
+            g_last_status = 1;
+            free_stage_args(st, n);
+            return 0;
+        }
+
+        if (pid == 0) {
+            int in = i > 0 ? pipes[i - 1][0] : -1;
+            int out = i < n - 1 ? pipes[i][1] : -1;
+            pid_t pg = i == 0 ? 0 : pids[0];
+
+            for (int j = 0; j < npipes; j++) {
+                if (j != i - 1) close(pipes[j][0]);
+                if (j != i) close(pipes[j][1]);
+            }
+            if (term_out)
+                close(capture[0]);
+
+            child_exec(&st[i], in, out, term_out, pg,
+                       APP_NAME, APP_NAME, APP_NAME);
+            _exit(127);
+        }
+
+        pids[i] = pid;
+        setpgid(pid, i == 0 ? pid : pids[0]);
+    }
+
+    for (i = 0; i < npipes; i++) { close(pipes[i][0]); close(pipes[i][1]); }
+    if (term_out)
+        close(capture[1]);
+
+    if (background) {
+        if (g_job_count < MAX_JOBS) {
+            Job *jb = &g_jobs[g_job_count++];
+            memset(jb, 0, sizeof *jb);
+            jb->id = g_next_job_id++;
+            jb->pgid = pids[0];
+            jb->npids = n;
+            for (i = 0; i < n; i++)
+                jb->pids[i] = pids[i];
+            jb->state = 0;
+            jb->bg = 1;
+            snprintf(jb->cmd, sizeof jb->cmd, "%s", st[0].args[0]);
+            emit("[%d] %d\n", jb->id, (int)pids[0]);
+        } else {
+            emit("%s: too many background jobs\n", APP_NAME);
+        }
+        g_last_status = 0;
+        free_stage_args(st, n);
+        return 1;
+    }
+
+    if (g_sh_self)
+        g_sh_self->fg_pgid = pids[0];
+
+    if (result) {
+        size_t len = 0;
+        char buf[1024];
+        ssize_t nr;
+        while ((nr = read(capture[0], buf, sizeof buf)) != 0) {
+            if (nr < 0) { if (errno == EINTR) continue; break; }
+            if (len + (size_t)nr < cap - 1) {
+                memcpy(result + len, buf, (size_t)nr);
+                len += (size_t)nr;
+            }
+        }
+        result[len] = '\0';
+        while (len > 0 && (result[len - 1] == '\n' || result[len - 1] == '\r'))
+            result[--len] = '\0';
+        close(capture[0]);
+    } else if (term_out) {
+        char buf[4096];
+        ssize_t nr;
+        while ((nr = read(capture[0], buf, sizeof buf)) != 0) {
+            if (nr < 0) { if (errno == EINTR) continue; break; }
+            emit_raw(buf, (size_t)nr);
+        }
+        close(capture[0]);
+    }
+
+    wait_foreground(pids, n);
+
+    if (g_sh_self)
+        g_sh_self->fg_pgid = 0;
+
+    free_stage_args(st, n);
     return 1;
 }
 
-static void execute_command(char *cmd)
+/* command substitution backend: runs through /bin/sh so pipes/quoting work */
+static int run_capture(const char *cmd, char *out, size_t cap)
 {
-    char copy[MAX_EXPANDED_CMD];
-    char expanded[MAX_EXPANDED_CMD];
-    char *tokens[MAX_ARGS * 2];
-    Stage stages[MAX_STAGES];
-    int nt, nstages;
+    int fds[2];
+    pid_t pid;
+    size_t len = 0;
+    char buf[1024];
+    ssize_t nr;
+    int st;
 
-    if (!cmd || !*cmd)
-        return;
+    if (cap == 0)
+        return 0;
+    out[0] = '\0';
 
-    save_command(cmd);
+    if (pipe(fds) < 0)
+        return 0;
 
-    if (!expand_substitutions(cmd, expanded, sizeof(expanded))) {
-        add_line("terminator: command substitution failed");
-        last_status = 1;
-        return;
+    pid = fork();
+    if (pid < 0) {
+        close(fds[0]); close(fds[1]);
+        return 0;
     }
-
-    memcpy(copy, expanded, strlen(expanded) + 1);
-
-    nt = tokenize(copy, tokens, MAX_ARGS * 2);
-
-    if (nt <= 0) {
-        last_status = nt == 0 ? 0 : 2;
-        return;
+    if (pid == 0) {
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[0]); close(fds[1]);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        if (g_cwd[0])
+            chdir(g_cwd);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
     }
-
-    if (!parse_pipeline(tokens, nt, stages, &nstages)) {
-        last_status = 2;
-        return;
+    close(fds[1]);
+    while ((nr = read(fds[0], buf, sizeof buf)) != 0) {
+        if (nr < 0) { if (errno == EINTR) continue; break; }
+        if (len + (size_t)nr < cap - 1) {
+            memcpy(out + len, buf, (size_t)nr);
+            len += (size_t)nr;
+        }
     }
+    out[len] = '\0';
+    close(fds[0]);
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(st))
+        g_last_status = WEXITSTATUS(st);
 
-    execute_pipeline(stages, nstages, NULL, 0);
+    while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r'))
+        out[--len] = '\0';
+    return 1;
 }
 
-static int quotes_balanced(const char *cmd)
+/* ------------------------------------------------------------------ */
+/* builtins                                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Change this tab's working directory.  In thread mode every tab shares one
+ * process, so we keep a per-tab logical cwd instead of relying on chdir();
+ * child processes chdir() into it just before exec.
+ */
+static int change_dir(const char *arg)
 {
-    char quote = 0;
-    int escaped = 0;
+    char target[PATH_MAX];
+    const char *p = arg;
 
-    for (size_t i = 0; cmd[i]; i++) {
-        char c = cmd[i];
+    if (!p || !*p)
+        p = getenv("HOME");
+    if (!p) {
+        emit("%s: cd: HOME not set\n", APP_NAME);
+        return -1;
+    }
 
-        if (escaped) {
-            escaped = 0;
+    if (p[0] == '~' && (p[1] == '/' || p[1] == '\0')) {
+        const char *h = getenv("HOME");
+        if (!h) { emit("%s: cd: HOME not set\n", APP_NAME); return -1; }
+        snprintf(target, sizeof target, "%s%s", h, p + 1);
+    } else if (p[0] == '/') {
+        snprintf(target, sizeof target, "%s", p);
+    } else {
+        snprintf(target, sizeof target, "%s/%s", g_cwd, p);
+    }
+
+    pthread_mutex_lock(&g_cwd_mtx);
+    if (chdir(target) != 0) {
+        pthread_mutex_unlock(&g_cwd_mtx);
+        emit("%s: cd: %s: %s\n", APP_NAME, p, strerror(errno));
+        return -1;
+    }
+    {
+        char real[PATH_MAX];
+        if (getcwd(real, sizeof real))
+            snprintf(g_cwd, sizeof g_cwd, "%s", real);
+    }
+    pthread_mutex_unlock(&g_cwd_mtx);
+    return 0;
+}
+
+static int is_builtin(const char *name)
+{
+    static const char *b[] = {
+        "cd", "exit", "history", "jobs", "fg", "bg", "source", ".",
+        "export", "pwd", "clear", "terminator", "true", "false", NULL
+    };
+    for (int i = 0; b[i]; i++)
+        if (!strcmp(name, b[i]))
+            return 1;
+    return 0;
+}
+
+static int run_builtin_parent(char **args, int argc)
+{
+    const char *c = args[0];
+
+    if (!strcmp(c, "cd")) {
+        g_last_status = change_dir(argc > 1 ? args[1] : NULL) == 0 ? 0 : 1;
+        return 1;
+    }
+    if (!strcmp(c, "exit")) {
+        g_last_status = argc > 1 ? atoi(args[1]) : g_last_status;
+        g_exit_requested = 1;
+        return 1;
+    }
+    if (!strcmp(c, "history")) {
+        char b[HIST_ENTRY];
+        for (int i = 0; i < history_count(); i++)
+            if (history_get(i, b, sizeof b))
+                emit("%5d  %s\n", i + 1, b);
+        g_last_status = 0;
+        return 1;
+    }
+    if (!strcmp(c, "pwd")) {
+        emit("%s\n", g_cwd);
+        g_last_status = 0;
+        return 1;
+    }
+    if (!strcmp(c, "export")) {
+        for (int i = 1; i < argc; i++) {
+            char *eq = strchr(args[i], '=');
+            if (eq) { *eq = '\0'; setenv(args[i], eq + 1, 1); *eq = '='; }
+        }
+        g_last_status = 0;
+        return 1;
+    }
+    if (!strcmp(c, "jobs")) {
+        for (int i = 0; i < g_job_count; i++)
+            if (g_jobs[i].state == 0)
+                emit("[%d]  running  %s\n", g_jobs[i].id, g_jobs[i].cmd);
+        g_last_status = 0;
+        return 1;
+    }
+    if (!strcmp(c, "bg")) {
+        int id = argc > 1 ? atoi(args[1]) : -1;
+        for (int i = 0; i < g_job_count; i++)
+            if (g_jobs[i].state == 0 && (id < 0 || g_jobs[i].id == id)) {
+                kill(-g_jobs[i].pgid, SIGCONT);
+                emit("[%d] %s &\n", g_jobs[i].id, g_jobs[i].cmd);
+            }
+        g_last_status = 0;
+        return 1;
+    }
+    if (!strcmp(c, "fg")) {
+        int id = argc > 1 ? atoi(args[1]) : -1;
+        for (int i = 0; i < g_job_count; i++)
+            if (g_jobs[i].state == 0 && (id < 0 || g_jobs[i].id == id)) {
+                kill(-g_jobs[i].pgid, SIGCONT);
+                if (g_sh_self) g_sh_self->fg_pgid = g_jobs[i].pgid;
+                wait_foreground(g_jobs[i].pids, g_jobs[i].npids);
+                g_jobs[i].state = 1;
+                if (g_sh_self) g_sh_self->fg_pgid = 0;
+            }
+        return 1;
+    }
+    if (!strcmp(c, "clear")) {
+        emit("\f");
+        g_last_status = 0;
+        return 1;
+    }
+    if (!strcmp(c, "true")) { g_last_status = 0; return 1; }
+    if (!strcmp(c, "false")) { g_last_status = 1; return 1; }
+    if (!strcmp(c, "terminator")) {
+        const char *sub = argc > 1 ? args[1] : "";
+        if (!strcmp(sub, "keybind")) {
+            char err[160];
+            if (argc < 4) {
+                emit("usage: terminator keybind <keyspec> <action>\n");
+                g_last_status = 2;
+                return 1;
+            }
+            if (!bindings_add_user(args[2], args[3], err, sizeof err)) {
+                emit("%s: keybind: %s (keeping default)\n", APP_NAME, err);
+                g_last_status = 1;
+                return 1;
+            }
+            bindings_save(config_path());
+            if (g_mode == MODE_PROCESS && g_ctl_fd >= 0) {
+                unsigned char t = CTL_BIND;
+                unsigned short l1 = (unsigned short)strlen(args[2]);
+                unsigned short l2 = (unsigned short)strlen(args[3]);
+                write_all(g_ctl_fd, &t, 1);
+                write_all(g_ctl_fd, &l1, sizeof l1);
+                write_all(g_ctl_fd, args[2], l1);
+                write_all(g_ctl_fd, &l2, sizeof l2);
+                write_all(g_ctl_fd, args[3], l2);
+            }
+            emit("%s: bound %s to %s (saved to %s)\n", APP_NAME, args[2], args[3], config_path());
+            g_last_status = 0;
+            return 1;
+        }
+        if (!strcmp(sub, "keybinds")) {
+            emit("user bindings:\n");
+            for (int i = 0; i < g_n_user_binds; i++) {
+                const char *n = XKeysymToString(g_user_binds[i].ks);
+                emit("  %s%s%s%-12s -> %s\n",
+                     (g_user_binds[i].mods & ControlMask) ? "Ctrl+" : "",
+                     (g_user_binds[i].mods & ShiftMask) ? "Shift+" : "",
+                     (g_user_binds[i].mods & Mod1Mask) ? "Alt+" : "",
+                     n ? n : "?", action_name(g_user_binds[i].act));
+            }
+            emit("defaults:\n");
+            for (int i = 0; i < g_n_def_binds; i++) {
+                const char *n = XKeysymToString(g_def_binds[i].ks);
+                emit("  %s%s%s%-12s -> %s\n",
+                     (g_def_binds[i].mods & ControlMask) ? "Ctrl+" : "",
+                     (g_def_binds[i].mods & ShiftMask) ? "Shift+" : "",
+                     (g_def_binds[i].mods & Mod1Mask) ? "Alt+" : "",
+                     n ? n : "?", action_name(g_def_binds[i].act));
+            }
+            g_last_status = 0;
+            return 1;
+        }
+        if (!strcmp(sub, "reload")) {
+            bindings_load(config_path(), 0);
+            if (g_ctl_fd >= 0) {
+                unsigned char t = CTL_RELOAD;
+                write_all(g_ctl_fd, &t, 1);
+            }
+            emit("%s: configuration reloaded\n", APP_NAME);
+            g_last_status = 0;
+            return 1;
+        }
+        if (!strcmp(sub, "history") && argc > 2 && !strcmp(args[2], "clear")) {
+            if (g_hist) {
+                sem_wait(&g_hist->sem);
+                g_hist->count = 0;
+                g_hist->head = 0;
+                sem_post(&g_hist->sem);
+            }
+            emit("%s: history cleared\n", APP_NAME);
+            g_last_status = 0;
+            return 1;
+        }
+        emit("%s: terminator: unknown subcommand '%s'\n", APP_NAME, sub);
+        g_last_status = 2;
+        return 1;
+    }
+    if (!strcmp(c, "source") || !strcmp(c, ".")) {
+        if (argc < 2) { emit("%s: source: filename required\n", APP_NAME); g_last_status = 2; return 1; }
+        FILE *f = fopen(args[1], "r");
+        if (!f) { emit("%s: source: %s: %s\n", APP_NAME, args[1], strerror(errno)); g_last_status = 1; return 1; }
+        char line[MAX_CMD];
+        while (fgets(line, sizeof line, f)) {
+            size_t L = strlen(line);
+            while (L && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = '\0';
+            char *p = line;
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (!*p || *p == '#') continue;
+            execute_line(p);
+        }
+        fclose(f);
+        return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* working-directory aware globbing (thread-safe)                     */
+/* ------------------------------------------------------------------ */
+
+static int glob_in_cwd(const char *pat, glob_t *g)
+{
+    char save[PATH_MAX];
+    int r;
+
+    if (pat[0] == '/')
+        return glob(pat, 0, NULL, g);
+
+    pthread_mutex_lock(&g_cwd_mtx);
+    if (getcwd(save, sizeof save) == NULL)
+        save[0] = '\0';
+    if (g_cwd[0])
+        chdir(g_cwd);
+    r = glob(pat, 0, NULL, g);
+    if (save[0])
+        chdir(save);
+    pthread_mutex_unlock(&g_cwd_mtx);
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
+/* multiWatch / watch                                                 */
+/* ------------------------------------------------------------------ */
+
+static void mw_dash(void)
+{
+    for (int i = 0; i < SEP_LEN; i++)
+        emit("-");
+    emit("\n");
+}
+
+/* split  ["a", "b"]  into the command strings; returns count or -1 */
+static int split_items(const char *raw, char *items[], int max)
+{
+    const char *open = strchr(raw, '[');
+    const char *close = strrchr(raw, ']');
+    const char *p;
+    size_t inlen, i;
+    char buf[MAX_CMD];
+    int bl = 0, n = 0;
+    char q = 0;
+
+    if (!open || !close || close < open)
+        return -1;
+
+    p = open + 1;
+    inlen = (size_t)(close - p);
+
+    for (i = 0; i <= inlen; i++) {
+        char c = (i < inlen) ? p[i] : ',';
+
+        if (q == 0 && c == ',') {
+            char *a;
+            int L;
+            buf[bl] = '\0';
+            a = buf;
+            while (*a && isspace((unsigned char)*a)) a++;
+            L = (int)strlen(a);
+            while (L > 0 && isspace((unsigned char)a[L - 1])) a[--L] = '\0';
+            if (L >= 2 && (a[0] == '"' || a[0] == '\'') && a[L - 1] == a[0]) {
+                a[L - 1] = '\0';
+                a++;
+            }
+            if (*a && n < max)
+                items[n++] = xstrdup(a);
+            bl = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            if (q == 0) q = c;
+            else if (q == c) q = 0;
+        }
+        if (bl < (int)sizeof buf - 1)
+            buf[bl++] = c;
+    }
+    return n;
+}
+
+static void do_multiwatch(const char *arg)
+{
+    char *items[32];
+    int ni = split_items(arg, items, 32);
+    long stamp = (long)time(NULL);
+    pid_t pgid;
+    int i;
+
+    if (ni <= 0) {
+        emit("%s: multiWatch: expected [\"cmd\", ...]\n", APP_NAME);
+        g_last_status = 2;
+        return;
+    }
+
+    if (g_sh_self) { g_sh_self->mw_active = 1; g_sh_self->mw_cancel = 0; }
+
+    for (;;) {
+        struct pollfd pf[32];
+        pid_t pids[32];
+        int started[32], done[32];
+        int remaining;
+
+        if (g_sh_self && g_sh_self->mw_cancel)
+            break;
+
+        stamp = (long)time(NULL);
+        pgid = 0;
+        for (i = 0; i < ni; i++) {
+            int p[2];
+            pid_t pid;
+
+            if (pipe(p) < 0) { emit("%s: pipe: %s\n", APP_NAME, strerror(errno)); break; }
+            pid = fork();
+            if (pid < 0) { close(p[0]); close(p[1]); emit("%s: fork: %s\n", APP_NAME, strerror(errno)); break; }
+            if (pid == 0) {
+                setpgid(0, pgid);
+                dup2(p[1], STDOUT_FILENO);
+                dup2(p[1], STDERR_FILENO);
+                close(p[0]); close(p[1]);
+                signal(SIGINT, SIG_DFL);
+                signal(SIGQUIT, SIG_DFL);
+                signal(SIGPIPE, SIG_DFL);
+                if (g_cwd[0]) chdir(g_cwd);
+                execl("/bin/sh", "sh", "-c", items[i], (char *)NULL);
+                _exit(127);
+            }
+            if (pgid == 0) pgid = pid;
+            setpgid(pid, pgid);
+            close(p[1]);
+            pf[i].fd = p[0]; pf[i].events = POLLIN; pf[i].revents = 0;
+            started[i] = 0; done[i] = 0; pids[i] = pid;
+        }
+
+        if (g_sh_self) g_sh_self->mw_pgid = pgid;
+
+        remaining = ni;
+        {
+            int last_nl = 1;
+            while (remaining > 0) {
+                int r;
+                if (g_sh_self && g_sh_self->mw_cancel)
+                    break;
+                r = poll(pf, ni, 200);
+                if (r < 0) { if (errno == EINTR) continue; break; }
+                if (r == 0) continue;
+                for (i = 0; i < ni; i++) {
+                    char b[2048];
+                    ssize_t nr;
+                    if (done[i] || pf[i].fd < 0) continue;
+                    if (!(pf[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                    nr = read(pf[i].fd, b, sizeof b);
+                    if (nr > 0) {
+                        if (!started[i]) {
+                            emit("\"%s\", %ld:\n", items[i], stamp);
+                            mw_dash();
+                            started[i] = 1;
+                        }
+                        emit_raw(b, (size_t)nr);
+                        last_nl = (b[nr - 1] == '\n');
+                    } else {
+                        if (!started[i]) {
+                            emit("\"%s\", %ld:\n", items[i], stamp);
+                            mw_dash();
+                        }
+                        mw_dash();
+                        last_nl = 1;
+                        close(pf[i].fd);
+                        pf[i].fd = -1;
+                        done[i] = 1;
+                        remaining--;
+                    }
+                }
+            }
+
+            if (g_sh_self && g_sh_self->mw_cancel) {
+                kill(-pgid, SIGINT);
+                for (i = 0; i < ni; i++)
+                    if (pf[i].fd >= 0) { close(pf[i].fd); pf[i].fd = -1; }
+                for (i = 0; i < ni; i++)
+                    while (waitpid(pids[i], NULL, 0) < 0 && errno == EINTR) {}
+                if (!last_nl)
+                    emit("\n");
+                break;
+            }
+        }
+
+        for (i = 0; i < ni; i++)
+            while (waitpid(pids[i], NULL, 0) < 0 && errno == EINTR) {}
+
+        /* wait out the remainder of the interval, but stay responsive */
+        for (;;) {
+            struct timespec ts = { 0, 100000000 };
+            if (g_sh_self && g_sh_self->mw_cancel) break;
+            if ((long)time(NULL) - stamp >= MW_INTERVAL) break;
+            nanosleep(&ts, NULL);
+        }
+        if (g_sh_self && g_sh_self->mw_cancel)
+            break;
+    }
+
+    if (g_sh_self) {
+        g_sh_self->mw_active = 0;
+        g_sh_self->mw_pgid = 0;
+        g_sh_self->mw_cancel = 0;
+    }
+    g_last_status = 0;
+    for (i = 0; i < ni; i++)
+        free(items[i]);
+}
+
+static void do_watch(const char *arg)
+{
+    char cmd[MAX_CMD];
+    size_t L;
+    int k;
+
+    snprintf(cmd, sizeof cmd, "%s", arg);
+    {
+        char *a = cmd;
+        while (*a && isspace((unsigned char)*a)) a++;
+        L = strlen(a);
+        while (L > 0 && isspace((unsigned char)a[L - 1])) a[--L] = '\0';
+        if (L >= 2 && (a[0] == '"' || a[0] == '\'') && a[L - 1] == a[0]) {
+            a[L - 1] = '\0';
+            a++;
+        }
+        memmove(cmd, a, strlen(a) + 1);
+    }
+    if (!cmd[0]) {
+        emit("%s: watch: command required\n", APP_NAME);
+        g_last_status = 2;
+        return;
+    }
+
+    if (g_sh_self) { g_sh_self->mw_active = 1; g_sh_self->mw_cancel = 0; }
+
+    while (!(g_sh_self && g_sh_self->mw_cancel)) {
+        pid_t pid;
+        int st;
+
+        emit("\f");
+        emit("Every %ds: %s\n\n", MW_INTERVAL, cmd);
+
+        pid = fork();
+        if (pid == 0) {
+            setpgid(0, 0);
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            signal(SIGPIPE, SIG_DFL);
+            if (g_cwd[0]) chdir(g_cwd);
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            _exit(127);
+        }
+        if (pid < 0) { emit("%s: fork: %s\n", APP_NAME, strerror(errno)); break; }
+        if (g_sh_self) g_sh_self->mw_pgid = pid;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        if (g_sh_self && g_sh_self->mw_cancel) break;
+
+        for (k = 0; k < MW_INTERVAL * 10; k++) {
+            struct timespec ts = { 0, 100000000 };
+            if (g_sh_self && g_sh_self->mw_cancel) break;
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    if (g_sh_self) {
+        g_sh_self->mw_active = 0;
+        g_sh_self->mw_pgid = 0;
+        g_sh_self->mw_cancel = 0;
+    }
+    emit("\n");
+    g_last_status = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* command dispatch                                                   */
+/* ------------------------------------------------------------------ */
+
+static void run_one(Token *toks, int nt)
+{
+    Stage st[MAX_STAGES];
+    int nst;
+
+    if (!parse_stages(toks, nt, st, &nst)) {
+        emit("%s: syntax error near unexpected token\n", APP_NAME);
+        g_last_status = 2;
+        return;
+    }
+    run_pipeline(st, nst, 1, NULL, 0);
+}
+
+static void execute_tokens(Token *toks, int nt)
+{
+    int i = 0;
+    int next_run = 1;
+
+    while (i < nt) {
+        int j = i;
+        int executed;
+        const char *op = NULL;
+
+        while (j < nt && !is_list_op(&toks[j]))
+            j++;
+
+        executed = next_run;
+        if (executed && j > i)
+            run_one(&toks[i], j - i);
+
+        if (j >= nt)
+            break;
+
+        op = toks[j].text;
+        if (!strcmp(op, "&&"))
+            next_run = executed ? (g_last_status == 0) : 0;
+        else if (!strcmp(op, "||"))
+            next_run = executed ? (g_last_status != 0) : 1;
+        else
+            next_run = 1;
+
+        i = j + 1;
+    }
+}
+
+static int word_is(const char *p, const char *w)
+{
+    size_t L = strlen(w);
+    if (strncmp(p, w, L))
+        return 0;
+    return p[L] == '\0' || isspace((unsigned char)p[L]);
+}
+
+static const char *skip_word(const char *p)
+{
+    while (*p && !isspace((unsigned char)*p)) p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return p;
+}
+
+static void execute_line(const char *line)
+{
+    Token toks[MAX_ARGS * 2];
+    char err[128];
+    const char *p = line;
+    int nt;
+
+    while (*p && isspace((unsigned char)*p))
+        p++;
+    if (!*p)
+        return;
+
+    if (word_is(p, "multiWatch")) {
+        history_add(line);
+        do_multiwatch(skip_word(p));
+        return;
+    }
+    if (word_is(p, "watch")) {
+        history_add(line);
+        do_watch(skip_word(p));
+        return;
+    }
+
+    history_add(line);
+
+    nt = lex(line, toks, MAX_ARGS * 2, err, sizeof err);
+    if (nt < 0) {
+        emit("%s: %s\n", APP_NAME, err);
+        g_last_status = 2;
+        return;
+    }
+    if (nt == 0)
+        return;
+
+    execute_tokens(toks, nt);
+}
+
+/* ------------------------------------------------------------------ */
+/* worker                                                             */
+/* ------------------------------------------------------------------ */
+
+#define PMARK_START 0x01
+#define PMARK_SEP   0x1f
+#define PMARK_END   0x02
+
+#define PROMPT_MAIN "user@terminator> "
+#define PROMPT_CONT "> "
+
+static int in_getc(void)
+{
+    unsigned char c;
+    ssize_t n;
+
+    for (;;) {
+        n = read(g_in_fd, &c, 1);
+        if (n == 1)
+            return c;
+        if (n == 0)
+            return -1;
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+}
+
+static void worker_emit_prompt(void)
+{
+    unsigned char m = PMARK_START;
+    const char *pr = PROMPT_MAIN;
+
+    emit_raw((char *)&m, 1);
+    emit_raw(g_cwd, strlen(g_cwd));
+    m = PMARK_SEP;
+    emit_raw((char *)&m, 1);
+    emit_raw(pr, strlen(pr));
+    m = PMARK_END;
+    emit_raw((char *)&m, 1);
+}
+
+static char *worker_read_command(void)
+{
+    static char buf[MAX_CMD];
+    int len = 0;
+
+    for (;;) {
+        int c = in_getc();
+        if (c < 0)
+            return NULL;
+        if (c == '\n')
+            break;
+        if (len < MAX_CMD - 1)
+            buf[len++] = (char)c;
+    }
+    buf[len] = '\0';
+    return xstrdup(buf);
+}
+
+static void worker_loop(WorkerCtx *ctx)
+{
+    g_out_fd = ctx->out_fd;
+    g_in_fd  = ctx->in_fd;
+    g_ctl_fd = ctx->ctl_fd;
+    g_hist   = ctx->hist;
+    g_sh_self = (Shared *)ctx->sh;
+    g_mode   = ctx->mode;
+
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+
+    if (!g_cwd[0] && getcwd(g_cwd, sizeof g_cwd) == NULL)
+        snprintf(g_cwd, sizeof g_cwd, "/");
+
+    for (;;) {
+        char *line;
+
+        worker_emit_prompt();
+        line = worker_read_command();
+        if (!line)
+            break;
+
+        {
+            char *p = line;
+            while (*p && isspace((unsigned char)*p))
+                p++;
+            if (*p)
+                execute_line(p);
+        }
+        free(line);
+
+        reap_background_jobs();
+
+        if (g_exit_requested)
+            break;
+    }
+
+    for (int i = 0; i < g_job_count; i++)
+        if (g_jobs[i].state == 0)
+            kill(-g_jobs[i].pgid, SIGHUP);
+
+    if (g_ctl_fd >= 0) {
+        unsigned char b = CTL_EXIT;
+        write_all(g_ctl_fd, &b, 1);
+    }
+}
+
+static void *worker_thread(void *p)
+{
+    worker_loop((WorkerCtx *)p);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* key bindings / config                                              */
+/* ------------------------------------------------------------------ */
+
+static const char *config_path(void)
+{
+    static char path[PATH_MAX];
+    const char *h = getenv("HOME");
+    snprintf(path, sizeof path, "%s/.terminatorrc", h ? h : ".");
+    return path;
+}
+
+static const char *action_name(Action a)
+{
+    switch (a) {
+    case ACT_LEFT: return "left";
+    case ACT_RIGHT: return "right";
+    case ACT_BOL: return "bol";
+    case ACT_EOL: return "eol";
+    case ACT_HIST_PREV: return "hist_prev";
+    case ACT_HIST_NEXT: return "hist_next";
+    case ACT_KILL_START: return "kill_start";
+    case ACT_KILL_END: return "kill_end";
+    case ACT_KILL_WORD: return "kill_word";
+    case ACT_CLEAR: return "clear";
+    case ACT_EXIT: return "exit";
+    case ACT_INTERRUPT: return "interrupt";
+    case ACT_COPY: return "copy";
+    case ACT_PASTE: return "paste";
+    case ACT_NEW_TAB: return "new_tab";
+    case ACT_CLOSE_TAB: return "close_tab";
+    case ACT_NEXT_TAB: return "next_tab";
+    case ACT_PREV_TAB: return "prev_tab";
+    case ACT_PAGE_UP: return "page_up";
+    case ACT_PAGE_DOWN: return "page_down";
+    default: return "none";
+    }
+}
+
+static Action action_from_name(const char *n)
+{
+    static const struct { const char *n; Action a; } tab[] = {
+        {"left", ACT_LEFT}, {"right", ACT_RIGHT}, {"bol", ACT_BOL}, {"eol", ACT_EOL},
+        {"hist_prev", ACT_HIST_PREV}, {"hist_next", ACT_HIST_NEXT},
+        {"kill_start", ACT_KILL_START}, {"kill_end", ACT_KILL_END},
+        {"kill_word", ACT_KILL_WORD}, {"clear", ACT_CLEAR}, {"exit", ACT_EXIT},
+        {"interrupt", ACT_INTERRUPT}, {"copy", ACT_COPY}, {"paste", ACT_PASTE},
+        {"new_tab", ACT_NEW_TAB}, {"close_tab", ACT_CLOSE_TAB},
+        {"next_tab", ACT_NEXT_TAB}, {"prev_tab", ACT_PREV_TAB},
+        {"page_up", ACT_PAGE_UP}, {"page_down", ACT_PAGE_DOWN},
+        {NULL, ACT_NONE}
+    };
+    for (int i = 0; tab[i].n; i++)
+        if (!strcasecmp(n, tab[i].n))
+            return tab[i].a;
+    return ACT_NONE;
+}
+
+static int ks_equal(KeySym a, KeySym b)
+{
+    if (a == b)
+        return 1;
+    if (a >= 0x20 && a < 0x7f && b >= 0x20 && b < 0x7f)
+        return tolower((int)a) == tolower((int)b);
+    return 0;
+}
+
+static int parse_keyspec(const char *spec, unsigned int *mods, KeySym *ks)
+{
+    char buf[256];
+    char *save = NULL, *tok, *last = NULL;
+
+    snprintf(buf, sizeof buf, "%s", spec);
+    *mods = 0;
+
+    tok = strtok_r(buf, "+", &save);
+    while (tok) {
+        char *next = strtok_r(NULL, "+", &save);
+        if (!next) { last = tok; break; }
+        if (!strcasecmp(tok, "ctrl") || !strcasecmp(tok, "control")) *mods |= ControlMask;
+        else if (!strcasecmp(tok, "shift")) *mods |= ShiftMask;
+        else if (!strcasecmp(tok, "alt") || !strcasecmp(tok, "meta") || !strcasecmp(tok, "mod1")) *mods |= Mod1Mask;
+        else return 0;
+        tok = next;
+    }
+    if (!last || !*last)
+        return 0;
+
+    *ks = XStringToKeysym(last);
+    if (*ks == NoSymbol && strlen(last) == 1)
+        *ks = (KeySym)(unsigned char)last[0];
+    return *ks != NoSymbol;
+}
+
+static void bindings_add_def(unsigned int mods, const char *spec, Action a)
+{
+    KeySym ks;
+    unsigned int m;
+
+    if (g_n_def_binds >= (int)(sizeof g_def_binds / sizeof g_def_binds[0]))
+        return;
+    if (!parse_keyspec(spec, &m, &ks))
+        return;
+    (void)mods;
+    g_def_binds[g_n_def_binds].mods = m;
+    g_def_binds[g_n_def_binds].ks = ks;
+    g_def_binds[g_n_def_binds].act = a;
+    g_n_def_binds++;
+}
+
+static void bindings_init(void)
+{
+    g_n_def_binds = 0;
+    bindings_add_def(0, "Left", ACT_LEFT);
+    bindings_add_def(0, "Right", ACT_RIGHT);
+    bindings_add_def(0, "Up", ACT_HIST_PREV);
+    bindings_add_def(0, "Down", ACT_HIST_NEXT);
+    bindings_add_def(0, "Ctrl+A", ACT_BOL);
+    bindings_add_def(0, "Ctrl+E", ACT_EOL);
+    bindings_add_def(0, "Ctrl+U", ACT_KILL_START);
+    bindings_add_def(0, "Ctrl+K", ACT_KILL_END);
+    bindings_add_def(0, "Ctrl+W", ACT_KILL_WORD);
+    bindings_add_def(0, "Ctrl+L", ACT_CLEAR);
+    bindings_add_def(0, "Ctrl+D", ACT_EXIT);
+    bindings_add_def(0, "Ctrl+C", ACT_INTERRUPT);
+    bindings_add_def(0, "Ctrl+Shift+C", ACT_COPY);
+    bindings_add_def(0, "Ctrl+Shift+V", ACT_PASTE);
+    bindings_add_def(0, "Ctrl+Shift+T", ACT_NEW_TAB);
+    bindings_add_def(0, "Ctrl+Shift+W", ACT_CLOSE_TAB);
+    bindings_add_def(0, "Ctrl+Tab", ACT_NEXT_TAB);
+    bindings_add_def(0, "Ctrl+Shift+Tab", ACT_PREV_TAB);
+    bindings_add_def(0, "Page_Up", ACT_PAGE_UP);
+    bindings_add_def(0, "Page_Down", ACT_PAGE_DOWN);
+}
+
+static int bindings_add_user(const char *keyspec, const char *action, char *err, size_t cap)
+{
+    unsigned int mods;
+    KeySym ks;
+    Action a = action_from_name(action);
+
+    if (a == ACT_NONE) {
+        snprintf(err, cap, "unknown action '%s'", action);
+        return 0;
+    }
+    if (!parse_keyspec(keyspec, &mods, &ks)) {
+        snprintf(err, cap, "invalid key '%s'", keyspec);
+        return 0;
+    }
+    for (int i = 0; i < g_n_user_binds; i++) {
+        if (g_user_binds[i].mods == mods && ks_equal(g_user_binds[i].ks, ks)) {
+            if (g_user_binds[i].act == a)
+                return 1;
+            if (g_loading_binds) {
+                /* duplicate key in the config file: report and keep the default */
+                snprintf(err, cap, "'%s' already bound to '%s'", keyspec,
+                         action_name(g_user_binds[i].act));
+                return 0;
+            }
+            /* an explicit 'terminator keybind' may rebind a key */
+            g_user_binds[i].act = a;
+            return 1;
+        }
+    }
+    if (g_n_user_binds >= (int)(sizeof g_user_binds / sizeof g_user_binds[0])) {
+        snprintf(err, cap, "too many bindings");
+        return 0;
+    }
+    g_user_binds[g_n_user_binds].mods = mods;
+    g_user_binds[g_n_user_binds].ks = ks;
+    g_user_binds[g_n_user_binds].act = a;
+    g_n_user_binds++;
+    return 1;
+}
+
+static Action bindings_lookup(unsigned int mods, KeySym ks)
+{
+    for (int i = 0; i < g_n_user_binds; i++)
+        if (g_user_binds[i].mods == mods && ks_equal(g_user_binds[i].ks, ks))
+            return g_user_binds[i].act;
+    for (int i = 0; i < g_n_def_binds; i++)
+        if (g_def_binds[i].mods == mods && ks_equal(g_def_binds[i].ks, ks))
+            return g_def_binds[i].act;
+    return ACT_NONE;
+}
+
+static int bindings_save(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return 0;
+    fprintf(f, "# Terminator key bindings -- generated by 'terminator keybind'\n");
+    for (int i = 0; i < g_n_user_binds; i++) {
+        char spec[128];
+        int p = 0;
+        spec[0] = '\0';
+        if (g_user_binds[i].mods & ControlMask) p += snprintf(spec + p, sizeof spec - p, "Ctrl+");
+        if (g_user_binds[i].mods & ShiftMask)   p += snprintf(spec + p, sizeof spec - p, "Shift+");
+        if (g_user_binds[i].mods & Mod1Mask)    p += snprintf(spec + p, sizeof spec - p, "Alt+");
+        {
+            const char *n = XKeysymToString(g_user_binds[i].ks);
+            if (n) snprintf(spec + p, sizeof spec - p, "%s", n);
+        }
+        fprintf(f, "bind %s %s\n", spec, action_name(g_user_binds[i].act));
+    }
+    fclose(f);
+    return 1;
+}
+
+static int bindings_load(const char *path, int verbose)
+{
+    FILE *f = fopen(path, "r");
+    char line[512];
+
+    g_n_user_binds = 0;
+    g_loading_binds = 1;
+    if (!f) {
+        g_loading_binds = 0;
+        if (verbose)
+            fprintf(stderr, "%s: no config at %s\n", APP_NAME, path);
+        return 0;
+    }
+    while (fgets(line, sizeof line, f)) {
+        char *p = line, *kw, *spec, *act;
+        size_t L = strlen(line);
+        while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = '\0';
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p || *p == '#')
+            continue;
+        kw = strtok(p, " \t");
+        if (!kw || (strcasecmp(kw, "bind") && strcasecmp(kw, "keybind")))
+            continue;
+        spec = strtok(NULL, " \t");
+        act = strtok(NULL, " \t");
+        if (!spec || !act) {
+            fprintf(stderr, "%s: %s: malformed binding: %s\n", APP_NAME, path, line);
+            continue;
+        }
+        {
+            char err[128];
+            if (!bindings_add_user(spec, act, err, sizeof err))
+                fprintf(stderr, "%s: %s: %s (keeping default)\n", APP_NAME, path, err);
+        }
+    }
+    fclose(f);
+    g_loading_binds = 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* GUI                                                                */
+/* ------------------------------------------------------------------ */
+
+static Shared *g_sh[MAX_TABS];
+static char    g_tab_cwd[MAX_TABS][PATH_MAX];
+static unsigned char g_ctlbuf[MAX_TABS][1024];   /* partial control-message frames */
+static int           g_ctlblen[MAX_TABS];
+
+static Atom g_text_atom;
+static Atom g_paste_prop;
+static int  g_paste_tab = -1;
+
+static void tab_append_line(Tab *t, const char *s)
+{
+    if (t->nlines == t->cap_lines) {
+        int nc = t->cap_lines ? t->cap_lines * 2 : 256;
+        char **nl = realloc(t->lines, (size_t)nc * sizeof(char *));
+        if (!nl)
+            return;
+        t->lines = nl;
+        t->cap_lines = nc;
+    }
+    if (t->nlines >= MAX_SCROLLBACK) {
+        free(t->lines[0]);
+        memmove(t->lines, t->lines + 1, (size_t)(t->nlines - 1) * sizeof(char *));
+        t->nlines--;
+    }
+    t->lines[t->nlines++] = xstrdup(s);
+}
+
+static void short_path(const char *cwd, char *out, int cap)
+{
+    const char *home = getenv("HOME");
+    size_t hl = home ? strlen(home) : 0;
+
+    if (home && hl && !strncmp(cwd, home, hl) &&
+        (cwd[hl] == '/' || cwd[hl] == '\0'))
+        snprintf(out, cap, "~%s", cwd + hl);
+    else
+        snprintf(out, cap, "%s", cwd);
+}
+
+static void gui_append_output(Tab *t, const char *data, int n, int idx)
+{
+    int i;
+
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)data[i];
+
+        if (t->in_prompt) {
+            if (c == PMARK_END) {
+                t->in_prompt = 0;
+                t->prompt[t->prompt_len] = '\0';
+                t->awaiting = 1;
+            } else if (c == PMARK_SEP) {
+                t->prompt[t->prompt_len] = '\0';
+                snprintf(g_tab_cwd[idx], sizeof g_tab_cwd[idx], "%s", t->prompt);
+                t->prompt_len = 0;
+            } else if (t->prompt_len < (int)sizeof t->prompt - 1) {
+                t->prompt[t->prompt_len++] = (char)c;
+            }
             continue;
         }
 
-        if (c == '\\' && quote != '\'') {
-            escaped = 1;
+        if (c == PMARK_START) { t->in_prompt = 1; t->prompt_len = 0; continue; }
+        if (c == '\f') { t->nlines = 0; t->pending_len = 0; continue; }
+        if (c == '\r') continue;
+        if (c == '\n') {
+            t->pending[t->pending_len] = '\0';
+            tab_append_line(t, t->pending);
+            t->pending_len = 0;
             continue;
         }
-
-        if (quote) {
-            if (c == quote)
-                quote = 0;
-        } else if (c == '\'' || c == '"') {
-            quote = c;
+        if (c == '\t') {
+            for (int k = 0; k < 8 && t->pending_len < MAX_LINE_LEN - 1; k++)
+                t->pending[t->pending_len++] = ' ';
+            continue;
         }
+        if (c < 32) continue;
+        if (t->pending_len < MAX_LINE_LEN - 1)
+            t->pending[t->pending_len++] = (char)c;
     }
-
-    return quote != 0 || escaped;
+    t->dirty = 1;
 }
 
-static void draw_terminal(Window win, GC gc,
-                          const char *cmd, int len)
+static int input_line_count(Tab *t)
+{
+    int n = 1;
+    for (int i = 0; i < t->len; i++)
+        if (t->input[i] == '\n')
+            n++;
+    return n;
+}
+
+/* m-th display line of the input area, including its prompt */
+static int input_line_at(Tab *t, int m, char *buf, int cap)
+{
+    int seg = 0, i = 0, len = 0;
+
+    while (seg < m) {
+        while (i < t->len && t->input[i] != '\n') i++;
+        if (i < t->len) i++;
+        seg++;
+    }
+    len = snprintf(buf, cap, "%s", m == 0 ? t->prompt : PROMPT_CONT);
+    while (i < t->len && t->input[i] != '\n' && len < cap - 1)
+        buf[len++] = t->input[i++];
+    buf[len] = '\0';
+    return len;
+}
+
+static int vline_count(Tab *t)
+{
+    int pend = t->pending_len > 0 ? 1 : 0;
+    return t->nlines + pend + (t->awaiting ? input_line_count(t) : 0);
+}
+
+static int vline_at(Tab *t, int k, char *buf, int cap)
+{
+    int nb = t->nlines;
+    int pend = t->pending_len > 0 ? 1 : 0;
+
+    if (k < nb) {
+        snprintf(buf, cap, "%s", t->lines[k]);
+        return (int)strlen(buf);
+    }
+    if (pend && k == nb) {
+        snprintf(buf, cap, "%s", t->pending);
+        return (int)strlen(buf);
+    }
+    if (t->awaiting)
+        return input_line_at(t, k - nb - pend, buf, cap);
+    buf[0] = '\0';
+    return 0;
+}
+
+static int text_width(const char *s, int len)
+{
+    if (g_font)
+        return XTextWidth(g_font, s, len);
+    return len * g_cw;
+}
+
+static void gui_draw(void)
 {
     XWindowAttributes attr;
+    char buf[MAX_LINE_LEN + 64];
+    int i, visible, total, start, k;
+    int pad = 6;
+    int top = TAB_HEIGHT + 4;
 
-    if (!XGetWindowAttributes(dpy, win, &attr))
+    if (!XGetWindowAttributes(g_dpy, g_win, &attr))
+        return;
+    g_win_w = attr.width;
+    g_win_h = attr.height;
+
+    XSetForeground(g_dpy, g_gc, BlackPixel(g_dpy, g_scr));
+    XFillRectangle(g_dpy, g_win, g_gc, 0, 0, attr.width, attr.height);
+
+    /* ---- tab bar ---- */
+    XSetForeground(g_dpy, g_gc, WhitePixel(g_dpy, g_scr));
+    for (i = 0; i < g_tab_count; i++) {
+        int x = i * TAB_WIDTH;
+        char label[PATH_MAX + 32];
+        char sp[PATH_MAX];
+        short_path(g_tab_cwd[i][0] ? g_tab_cwd[i] : ".", sp, sizeof sp);
+        snprintf(label, sizeof label, "[ %d: %s ]", i + 1, sp);
+        if ((int)strlen(label) > 14)
+            label[14] = '\0';
+
+        if (i == g_active) {
+            /* active tab: white block, black text */
+            XSetForeground(g_dpy, g_gc, WhitePixel(g_dpy, g_scr));
+            XFillRectangle(g_dpy, g_win, g_gc, x + 1, 2, TAB_WIDTH - 3, TAB_HEIGHT - 4);
+            XSetForeground(g_dpy, g_gc, BlackPixel(g_dpy, g_scr));
+        } else {
+            XSetForeground(g_dpy, g_gc, WhitePixel(g_dpy, g_scr));
+            XDrawRectangle(g_dpy, g_win, g_gc, x + 1, 2, TAB_WIDTH - 3, TAB_HEIGHT - 4);
+        }
+        XDrawString(g_dpy, g_win, g_gc, x + 5,
+                    (TAB_HEIGHT + g_font->ascent) / 2 + 3, label, (int)strlen(label));
+        /* close box */
+        XDrawRectangle(g_dpy, g_win, g_gc, x + TAB_WIDTH - 20, 7, 12, 12);
+        XDrawString(g_dpy, g_win, g_gc, x + TAB_WIDTH - 17, 17, "x", 1);
+    }
+    /* add-tab button */
+    XSetForeground(g_dpy, g_gc, WhitePixel(g_dpy, g_scr));
+    XDrawRectangle(g_dpy, g_win, g_gc, g_tab_count * TAB_WIDTH + 2, 2, 40, TAB_HEIGHT - 4);
+    XDrawString(g_dpy, g_win, g_gc, g_tab_count * TAB_WIDTH + 12, 20, "+", 1);
+
+    /* ---- text area ---- */
+    {
+        Tab *t = &g_tabs[g_active];
+        int sel_a = -1, sel_b = -1;
+
+        visible = (attr.height - top - pad) / g_ch;
+        if (visible < 1)
+            visible = 1;
+        total = vline_count(t);
+        if (t->scroll < 0) t->scroll = 0;
+        if (t->scroll > (total > visible ? total - visible : 0))
+            t->scroll = (total > visible ? total - visible : 0);
+        start = total - visible - t->scroll;
+        if (start < 0) start = 0;
+
+        if (t->sel_active) {
+            sel_a = t->sel_l0 * 100000 + t->sel_c0;
+            sel_b = t->sel_l1 * 100000 + t->sel_c1;
+            if (sel_a > sel_b) { int tmp = sel_a; sel_a = sel_b; sel_b = tmp; }
+        }
+
+        for (k = start; k < total && k < start + visible; k++) {
+            int y = top + (k - start) * g_ch;
+            int len = vline_at(t, k, buf, sizeof buf);
+
+            if (t->sel_active && k * 100000 >= sel_a && k * 100000 <= sel_b) {
+                /* selected line: white block, black text */
+                XSetForeground(g_dpy, g_gc, WhitePixel(g_dpy, g_scr));
+                XFillRectangle(g_dpy, g_win, g_gc, pad, y, attr.width - 2 * pad, g_ch);
+                XSetForeground(g_dpy, g_gc, BlackPixel(g_dpy, g_scr));
+            } else {
+                XSetForeground(g_dpy, g_gc, WhitePixel(g_dpy, g_scr));
+            }
+            XDrawString(g_dpy, g_win, g_gc, pad, y + g_font->ascent, buf, len);
+        }
+
+        /* cursor */
+        if (t->awaiting && t->scroll == 0) {
+            int m = 0, segstart = 0, i2;
+            int cx, cy;
+            for (i2 = 0; i2 < t->cursor; i2++)
+                if (t->input[i2] == '\n') { m++; segstart = i2 + 1; }
+            {
+                char seg[MAX_CMD];
+                int sl = 0;
+                for (i2 = segstart; i2 < t->cursor; i2++)
+                    seg[sl++] = t->input[i2];
+                seg[sl] = '\0';
+                cx = pad + text_width(m == 0 ? t->prompt : PROMPT_CONT,
+                                      (int)strlen(m == 0 ? t->prompt : PROMPT_CONT));
+                cx += text_width(seg, sl);
+            }
+            cy = top + (t->nlines + (t->pending_len > 0 ? 1 : 0) + m - start) * g_ch;
+            XSetForeground(g_dpy, g_gc, WhitePixel(g_dpy, g_scr));
+            XDrawLine(g_dpy, g_win, g_gc, cx, cy, cx, cy + g_ch - 2);
+        }
+    }
+
+    XFlush(g_dpy);
+}
+
+/* ------------------------------------------------------------------ */
+/* selection / clipboard                                              */
+/* ------------------------------------------------------------------ */
+
+static int build_selection(Tab *t, char *out, int cap)
+{
+    int l0 = t->sel_l0, c0 = t->sel_c0, l1 = t->sel_l1, c1 = t->sel_c1;
+    int a, b, len = 0;
+    char buf[MAX_LINE_LEN + 64];
+
+    if (!t->sel_active)
+        return 0;
+    if (l0 > l1 || (l0 == l1 && c0 > c1)) { a = l1; b = l0; }
+    else { a = l0; b = l1; }
+
+    for (int k = a; k <= b; k++) {
+        int n = vline_at(t, k, buf, sizeof buf);
+        int s = (k == a) ? c0 : 0;
+        int e = (k == b) ? c1 : n;
+        if (s < 0) s = 0;
+        if (e > n) e = n;
+        if (e > s) {
+            int take = e - s;
+            if (len + take >= cap - 2) take = cap - 2 - len;
+            if (take > 0) { memcpy(out + len, buf + s, (size_t)take); len += take; }
+        }
+        if (k != b && len < cap - 1)
+            out[len++] = '\n';
+    }
+    out[len] = '\0';
+    return len;
+}
+
+static void gui_copy(Tab *t)
+{
+    char *txt;
+    int n;
+
+    txt = malloc(65536);
+    if (!txt)
+        return;
+    n = build_selection(t, txt, 65536);
+    if (n <= 0) { free(txt); return; }
+    snprintf(g_sel_text, sizeof g_sel_text, "%s", txt);
+    g_sel_len = (int)strlen(g_sel_text);
+    free(txt);
+
+    XSetSelectionOwner(g_dpy, XA_PRIMARY, g_win, CurrentTime);
+    XSetSelectionOwner(g_dpy, g_clipboard, g_win, CurrentTime);
+}
+
+static void gui_request_paste(int idx, Atom sel)
+{
+    g_paste_tab = idx;
+    XConvertSelection(g_dpy, sel, g_utf8, g_paste_prop, g_win, CurrentTime);
+}
+
+static void gui_do_paste(const unsigned char *data, int n)
+{
+    Tab *t;
+    int i;
+
+    if (g_paste_tab < 0 || g_paste_tab >= g_tab_count)
+        return;
+    t = &g_tabs[g_paste_tab];
+    for (i = 0; i < n; i++) {
+        unsigned char c = data[i];
+        if (c == '\r') continue;
+        if (c != '\n' && c != '\t' && c < 32) continue;
+        if (t->len < MAX_CMD - 1) {
+            memmove(t->input + t->cursor + 1, t->input + t->cursor,
+                    (size_t)(t->len - t->cursor));
+            t->input[t->cursor] = (char)c;
+            t->len++;
+            t->cursor++;
+        }
+    }
+    t->input[t->len] = '\0';
+    t->dirty = 1;
+}
+
+static void handle_selection_request(XSelectionRequestEvent *r)
+{
+    XSelectionEvent resp;
+    Atom prop = r->property == None ? r->target : r->property;
+
+    resp.type = SelectionNotify;
+    resp.display = g_dpy;
+    resp.requestor = r->requestor;
+    resp.selection = r->selection;
+    resp.target = r->target;
+    resp.time = r->time;
+    resp.property = None;
+
+    if (r->target == g_targets) {
+        Atom list[4];
+        list[0] = g_utf8;
+        list[1] = XA_STRING;
+        list[2] = g_text_atom;
+        list[3] = g_targets;
+        XChangeProperty(g_dpy, r->requestor, prop, XA_ATOM, 32, PropModeReplace,
+                        (unsigned char *)list, 4);
+        resp.property = prop;
+    } else if (r->target == g_utf8 || r->target == XA_STRING ||
+               r->target == g_text_atom) {
+        XChangeProperty(g_dpy, r->requestor, prop, r->target, 8, PropModeReplace,
+                        (unsigned char *)g_sel_text, g_sel_len);
+        resp.property = prop;
+    }
+    XSendEvent(g_dpy, r->requestor, False, 0, (XEvent *)&resp);
+}
+
+static void handle_selection_notify(XSelectionEvent *s)
+{
+    Atom type;
+    int fmt;
+    unsigned long nitems, after;
+    unsigned char *data = NULL;
+
+    if (s->property == None)
+        return;
+    if (XGetWindowProperty(g_dpy, g_win, g_paste_prop, 0, (1 << 20), False,
+                           AnyPropertyType, &type, &fmt, &nitems, &after,
+                           &data) == Success && data) {
+        gui_do_paste(data, (int)nitems);
+        XFree(data);
+    }
+    XDeleteProperty(g_dpy, g_win, g_paste_prop);
+}
+
+/* ------------------------------------------------------------------ */
+/* line editing actions                                               */
+/* ------------------------------------------------------------------ */
+
+static void hist_prev(Tab *t)
+{
+    int c = history_count();
+    if (c == 0)
+        return;
+    if (t->hist_pos == -1) {
+        snprintf(t->hist_draft, sizeof t->hist_draft, "%s", t->input);
+        t->hist_pos = c - 1;
+    } else if (t->hist_pos > 0) {
+        t->hist_pos--;
+    } else {
+        return;
+    }
+    if (history_get(t->hist_pos, t->input, sizeof t->input)) {
+        t->len = (int)strlen(t->input);
+        t->cursor = t->len;
+    }
+}
+
+static void hist_next(Tab *t)
+{
+    int c = history_count();
+    if (t->hist_pos == -1)
+        return;
+    t->hist_pos++;
+    if (t->hist_pos >= c) {
+        t->hist_pos = -1;
+        snprintf(t->input, sizeof t->input, "%s", t->hist_draft);
+    } else {
+        history_get(t->hist_pos, t->input, sizeof t->input);
+    }
+    t->len = (int)strlen(t->input);
+    t->cursor = t->len;
+}
+
+static void kill_word(Tab *t)
+{
+    int i = t->cursor;
+    while (i > 0 && t->input[i - 1] == ' ') i--;
+    while (i > 0 && t->input[i - 1] != ' ') i--;
+    memmove(t->input + i, t->input + t->cursor, (size_t)(t->len - t->cursor));
+    t->len -= (t->cursor - i);
+    t->cursor = i;
+    t->input[t->len] = '\0';
+}
+
+static void gui_interrupt(Tab *t, int idx)
+{
+    Shared *sh = g_sh[idx];
+    int had_job = 0;
+
+    if (sh && sh->mw_active) {
+        if (sh->mw_pgid > 0) kill(-sh->mw_pgid, SIGINT);
+        sh->mw_cancel = 1;
+        had_job = 1;
+    } else if (sh && sh->fg_pgid > 0) {
+        kill(-sh->fg_pgid, SIGINT);
+        had_job = 1;
+    }
+
+    tab_append_line(t, "^C");
+    t->input[0] = '\0';
+    t->len = 0;
+    t->cursor = 0;
+    t->hist_pos = -1;
+    t->awaiting = had_job ? 0 : 1;
+    t->dirty = 1;
+}
+
+static void gui_submit(Tab *t, int idx)
+{
+    char buf[MAX_LINE_LEN + 64];
+    char *p = t->input;
+    int first = 1;
+
+    (void)idx;
+    for (;;) {
+        char *nl = strchr(p, '\n');
+        if (nl)
+            *nl = '\0';
+        snprintf(buf, sizeof buf, "%s%s", first ? t->prompt : PROMPT_CONT, p);
+        tab_append_line(t, buf);
+        if (!nl)
+            break;
+        p = nl + 1;
+        first = 0;
+    }
+
+    if (t->in_w >= 0) {
+        write_all(t->in_w, t->input, strlen(t->input));
+        write_all(t->in_w, "\n", 1);
+    }
+    t->input[0] = '\0';
+    t->len = 0;
+    t->cursor = 0;
+    t->hist_pos = -1;
+    t->awaiting = 0;
+    t->dirty = 1;
+}
+
+static void gui_do_action(Action a, Tab *t, int idx)
+{
+    switch (a) {
+    case ACT_LEFT:      if (t->cursor > 0) t->cursor--; break;
+    case ACT_RIGHT:     if (t->cursor < t->len) t->cursor++; break;
+    case ACT_BOL:       t->cursor = 0; break;
+    case ACT_EOL:       t->cursor = t->len; break;
+    case ACT_HIST_PREV: hist_prev(t); break;
+    case ACT_HIST_NEXT: hist_next(t); break;
+    case ACT_KILL_START:
+        memmove(t->input, t->input + t->cursor, (size_t)(t->len - t->cursor));
+        t->len -= t->cursor;
+        t->cursor = 0;
+        t->input[t->len] = '\0';
+        break;
+    case ACT_KILL_END:
+        t->len = t->cursor;
+        t->input[t->len] = '\0';
+        break;
+    case ACT_KILL_WORD: kill_word(t); break;
+    case ACT_CLEAR:     t->nlines = 0; t->pending_len = 0; t->scroll = 0; break;
+    case ACT_EXIT:
+        if (t->len == 0) { gui_close_tab(idx); return; }
+        break;
+    case ACT_INTERRUPT: gui_interrupt(t, idx); return;
+    case ACT_COPY:      gui_copy(t); return;
+    case ACT_PASTE:     gui_request_paste(idx, g_clipboard); return;
+    case ACT_NEW_TAB:   gui_new_tab(); return;
+    case ACT_CLOSE_TAB: gui_close_tab(idx); return;
+    case ACT_NEXT_TAB:  if (g_tab_count > 1) { g_active = (g_active + 1) % g_tab_count; } break;
+    case ACT_PREV_TAB:  if (g_tab_count > 1) { g_active = (g_active - 1 + g_tab_count) % g_tab_count; } break;
+    case ACT_PAGE_UP:   g_tabs[g_active].scroll += 5; break;
+    case ACT_PAGE_DOWN: g_tabs[g_active].scroll -= 5; if (g_tabs[g_active].scroll < 0) g_tabs[g_active].scroll = 0; break;
+    default: break;
+    }
+    g_tabs[g_active].dirty = 1;
+}
+
+static void gui_handle_key(XKeyEvent *ke)
+{
+    Tab *t = &g_tabs[g_active];
+    char text[64];
+    KeySym ks = NoSymbol;
+    int n, ctrl, shift, alt;
+    unsigned int mods;
+    Action a;
+
+    n = XLookupString(ke, text, sizeof text, &ks, NULL);
+    ctrl = (ke->state & ControlMask) != 0;
+    shift = (ke->state & ShiftMask) != 0;
+    alt = (ke->state & Mod1Mask) != 0;
+    mods = 0;
+    if (ctrl) mods |= ControlMask;
+    if (shift) mods |= ShiftMask;
+    if (alt) mods |= Mod1Mask;
+
+    a = bindings_lookup(mods, ks);
+    if (a != ACT_NONE) {
+        gui_do_action(a, t, g_active);
+        gui_draw();
+        return;
+    }
+
+    if (!t->awaiting) {
+        /* still allow tab switching / redraw hotkeys while a command runs */
+        return;
+    }
+
+    if (ks == XK_Return || ks == XK_KP_Enter) {
+        if (command_incomplete(t->input)) {
+            if (t->len < MAX_CMD - 1) {
+                memmove(t->input + t->cursor + 1, t->input + t->cursor,
+                        (size_t)(t->len - t->cursor));
+                t->input[t->cursor] = '\n';
+                t->len++;
+                t->cursor++;
+                t->input[t->len] = '\0';
+            }
+        } else {
+            gui_submit(t, g_active);
+        }
+        gui_draw();
+        return;
+    }
+
+    if (ks == XK_BackSpace || ks == XK_Delete) {
+        if (t->cursor > 0) {
+            memmove(t->input + t->cursor - 1, t->input + t->cursor,
+                    (size_t)(t->len - t->cursor));
+            t->cursor--;
+            t->len--;
+            t->input[t->len] = '\0';
+        }
+        gui_draw();
+        return;
+    }
+
+    if (ctrl || alt)
         return;
 
-    int visible = (attr.height - 20) / LINE_HEIGHT;
-    if (visible < 1)
-        visible = 1;
-
-    int cmd_lines = 1;
-
-    for (int i = 0; i < len; i++)
-        if (cmd[i] == '\n')
-            cmd_lines++;
-
-    int total = line_count + cmd_lines;
-    int max_scroll = total > visible ? total - visible : 0;
-
-    if (scroll_offset > max_scroll)
-        scroll_offset = max_scroll;
-    if (scroll_offset < 0)
-        scroll_offset = 0;
-
-    int start = total - visible - scroll_offset;
-    if (start < 0)
-        start = 0;
-
-    XClearWindow(dpy, win);
-
-    for (int i = start; i < total && i < start + visible; i++) {
-        int y = 20 + (i - start) * LINE_HEIGHT;
-
-        if (i < line_count) {
-            XDrawString(dpy, win, gc, 10, y,
-                        history[i], (int)strlen(history[i]));
-        } else {
-            int line_no = i - line_count;
-            int pos = 0;
-
-            for (int j = 0; j < line_no; j++) {
-                while (pos < len && cmd[pos] != '\n')
-                    pos++;
-                if (pos < len)
-                    pos++;
+    if (n > 0 && (unsigned char)text[0] >= 32) {
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)text[i];
+            if (c < 32 || c == 127)
+                continue;
+            if (t->len < MAX_CMD - 1) {
+                memmove(t->input + t->cursor + 1, t->input + t->cursor,
+                        (size_t)(t->len - t->cursor));
+                t->input[t->cursor] = (char)c;
+                t->len++;
+                t->cursor++;
             }
-
-            int begin = pos;
-
-            while (pos < len && cmd[pos] != '\n')
-                pos++;
-
-            XDrawString(dpy, win, gc, 10, y,
-                        line_no == 0 ? "$ " : "> ", 2);
-
-            if (pos > begin)
-                XDrawString(dpy, win, gc, 25, y,
-                            cmd + begin, pos - begin);
         }
+        t->input[t->len] = '\0';
+        t->dirty = 1;
+        gui_draw();
     }
-
-    XFlush(dpy);
 }
 
-static void run(Window win)
+/* ------------------------------------------------------------------ */
+/* tabs                                                               */
+/* ------------------------------------------------------------------ */
+
+static void set_nonblock(int fd)
 {
-    XEvent ev;
-    XGCValues values;
-    GC gc;
-    char cmd[MAX_CMD];
-    int len = 0;
-    int running = 1;
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0)
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
 
-    cmd[0] = '\0';
+static int gui_new_tab(void)
+{
+    int idx = g_tab_count;
+    Tab *t;
+    int in[2], out[2], ctl[2];
+    Shared *sh;
+    WorkerCtx *ctx;
 
-    values.foreground = WhitePixel(dpy, scr);
-    values.background = BlackPixel(dpy, scr);
+    if (idx >= MAX_TABS)
+        return -1;
 
-    gc = XCreateGC(dpy, win, GCForeground | GCBackground, &values);
-    XMapWindow(dpy, win);
-    
-    XFlush(dpy);
+    if (pipe(in) < 0 || pipe(out) < 0 || pipe(ctl) < 0)
+        return -1;
 
-    XEvent event;
-    do {
-        XNextEvent(dpy, &event);
-    } while (event.type != MapNotify);
+    /* The GUI must never block in read(): it drains these two ends between
+     * poll() wakeups.  The worker's ends stay blocking on purpose. */
+    set_nonblock(out[0]);
+    set_nonblock(ctl[0]);
 
-    XSetInputFocus(dpy, win, RevertToParent, CurrentTime);
-    XFlush(dpy);
+    sh = mmap(NULL, sizeof(Shared), PROT_READ | PROT_WRITE,
+              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (sh == MAP_FAILED) {
+        close(in[0]); close(in[1]); close(out[0]); close(out[1]);
+        close(ctl[0]); close(ctl[1]);
+        return -1;
+    }
+    memset(sh, 0, sizeof *sh);
+    g_sh[idx] = sh;
+    g_tab_cwd[idx][0] = '\0';
 
-    while (running && shell_running) {
-        XNextEvent(dpy, &ev);
+    t = &g_tabs[idx];
+    memset(t, 0, sizeof *t);
+    t->hist_pos = -1;
+    t->in_r = in[0]; t->in_w = in[1];
+    t->out_r = out[0]; t->out_w = out[1];
+    t->ctl_r = ctl[0]; t->ctl_w = ctl[1];
+    t->alive = 1;
+    t->dirty = 1;
 
-        switch (ev.type) {
-        case Expose:
-        case ConfigureNotify:
-            if (ev.type == ConfigureNotify ||
-                ev.xexpose.count == 0)
-                draw_terminal(win, gc, cmd, len);
-            break;
+    ctx = malloc(sizeof *ctx);
+    if (!ctx)
+        return -1;
+    ctx->in_fd = in[0];
+    ctx->out_fd = out[1];
+    ctx->ctl_fd = ctl[1];
+    ctx->hist = g_hist;
+    ctx->sh = sh;
+    ctx->mode = g_mode;
 
-        case ClientMessage:
-            if ((Atom)ev.xclient.data.l[0] == wm_delete_window) {
-                running = 0;
-                shell_running = 0;
+    if (g_mode == MODE_PROCESS) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(in[1]); close(out[0]); close(ctl[0]);
+            signal(SIGCHLD, SIG_DFL);
+            worker_loop(ctx);
+            _exit(0);
+        }
+        if (pid < 0) {
+            free(ctx);
+            return -1;
+        }
+        t->pid = pid;
+        t->tid = 0;
+        close(in[0]); close(out[1]); close(ctl[1]);
+    } else {
+        if (pthread_create(&t->tid, NULL, worker_thread, ctx) != 0) {
+            free(ctx);
+            return -1;
+        }
+        /* threads share the fd table, so the worker's ends stay open */
+    }
+
+    g_tab_count++;
+    g_active = idx;
+    return idx;
+}
+
+static void gui_close_tab(int idx)
+{
+    Tab *t;
+    int i;
+
+    if (idx < 0 || idx >= g_tab_count)
+        return;
+
+    if (g_tab_count == 1) {
+        g_running = 0;
+        return;
+    }
+
+    t = &g_tabs[idx];
+
+    if (g_sh[idx]) {
+        if (g_sh[idx]->fg_pgid > 0) kill(-g_sh[idx]->fg_pgid, SIGHUP);
+        if (g_sh[idx]->mw_active && g_sh[idx]->mw_pgid > 0)
+            kill(-g_sh[idx]->mw_pgid, SIGINT);
+    }
+
+    if (t->in_w >= 0) { close(t->in_w); t->in_w = -1; }
+    if (t->out_r >= 0) { close(t->out_r); t->out_r = -1; }
+    if (t->ctl_r >= 0) { close(t->ctl_r); t->ctl_r = -1; }
+
+    if (g_mode == MODE_PROCESS) {
+        if (t->pid > 0) { kill(t->pid, SIGKILL); while (waitpid(t->pid, NULL, 0) < 0 && errno == EINTR) {} }
+    }
+    /* thread mode: the worker exits on its own once its read() sees EOF */
+
+    for (i = 0; i < t->nlines; i++)
+        free(t->lines[i]);
+    free(t->lines);
+
+    for (i = idx; i < g_tab_count - 1; i++) {
+        g_tabs[i] = g_tabs[i + 1];
+        g_sh[i] = g_sh[i + 1];
+        memcpy(g_tab_cwd[i], g_tab_cwd[i + 1], PATH_MAX);
+    }
+    memset(&g_tabs[g_tab_count - 1], 0, sizeof(Tab));
+    g_sh[g_tab_count - 1] = NULL;
+    g_tab_count--;
+
+    if (g_active >= g_tab_count)
+        g_active = g_tab_count - 1;
+    g_tabs[g_active].dirty = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* control messages from a worker                                     */
+/* ------------------------------------------------------------------ */
+
+static void gui_read_ctl(int idx)
+{
+    Tab *t = &g_tabs[idx];
+    unsigned char *b = g_ctlbuf[idx];
+    int *bl = &g_ctlblen[idx];
+
+    for (;;) {
+        ssize_t n;
+        int off = 0;
+
+        if (*bl >= (int)sizeof g_ctlbuf[idx])
+            *bl = 0;                    /* desync: drop what we have */
+
+        n = read(t->ctl_r, b + *bl, sizeof g_ctlbuf[idx] - (size_t)*bl);
+        if (n > 0)
+            *bl += (int)n;
+        else if (n == 0) { gui_close_tab(idx); return; }
+        else if (errno == EINTR) continue;
+        else break;                     /* EAGAIN: nothing more right now */
+
+        /* parse every complete frame in the buffer */
+        while (off < *bl) {
+            unsigned char type = b[off];
+
+            if (type == CTL_EXIT) { gui_close_tab(idx); return; }
+            if (type == CTL_RELOAD) {
+                bindings_load(config_path(), 0);
+                tab_append_line(t, "[configuration reloaded]");
+                t->dirty = 1;
+                off += 1;
+                continue;
             }
+            if (type == CTL_BIND) {
+                unsigned short l1, l2;
+                char spec[257], act[129], err[160];
+                if (*bl - off < 5)
+                    break;              /* need the two length fields */
+                memcpy(&l1, b + off + 1, 2);
+                memcpy(&l2, b + off + 3, 2);
+                if (l1 > 256) l1 = 256;
+                if (l2 > 128) l2 = 128;
+                if (*bl - off < 5 + (int)l1 + (int)l2)
+                    break;              /* frame not complete yet */
+                memcpy(spec, b + off + 5, l1);
+                spec[l1] = '\0';
+                memcpy(act, b + off + 5 + l1, l2);
+                act[l2] = '\0';
+                if (bindings_add_user(spec, act, err, sizeof err))
+                    bindings_save(config_path());
+                off += 5 + l1 + l2;
+                continue;
+            }
+            off += 1;                   /* unknown byte: resynchronise */
+        }
+
+        if (off > 0) {
+            memmove(b, b + off, (size_t)(*bl - off));
+            *bl -= off;
+        }
+    }
+}
+
+static void gui_read_output(int idx)
+{
+    Tab *t = &g_tabs[idx];
+    char buf[8192];
+
+    for (;;) {
+        ssize_t n = read(t->out_r, buf, sizeof buf);
+        if (n > 0) {
+            gui_append_output(t, buf, (int)n, idx);
+            continue;
+        }
+        if (n == 0) {
+            /* worker closed the pipe -> session ended */
+            gui_close_tab(idx);
+            return;
+        }
+        if (errno == EINTR)
+            continue;
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* mouse                                                              */
+/* ------------------------------------------------------------------ */
+
+static void gui_tabbar_click(int x, int y)
+{
+    int i;
+    (void)y;
+
+    for (i = 0; i < g_tab_count; i++) {
+        int tx = i * TAB_WIDTH;
+        if (x >= tx && x < tx + TAB_WIDTH) {
+            if (x >= tx + TAB_WIDTH - 22) {
+                gui_close_tab(i);
+            } else {
+                g_active = i;
+                g_tabs[i].dirty = 1;
+            }
+            return;
+        }
+    }
+    if (x >= g_tab_count * TAB_WIDTH + 2 && x < g_tab_count * TAB_WIDTH + 44)
+        gui_new_tab();
+}
+
+static void gui_mouse_text(Tab *t, int x, int y, int release)
+{
+    int top = TAB_HEIGHT + 4, pad = 6;
+    int visible = (g_win_h - top - 6) / g_ch;
+    int total = vline_count(t);
+    int start;
+    int line, col;
+    char buf[MAX_LINE_LEN + 64];
+
+    if (visible < 1) visible = 1;
+    start = total - visible - t->scroll;
+    if (start < 0) start = 0;
+
+    line = start + (y - top) / g_ch;
+    if (line < 0) line = 0;
+    if (line >= total) line = total - 1;
+    if (line < 0) return;
+
+    vline_at(t, line, buf, sizeof buf);
+    col = (x - pad) / (g_cw > 0 ? g_cw : 8);
+    if (col < 0) col = 0;
+    if (col > (int)strlen(buf)) col = (int)strlen(buf);
+
+    if (!release) {
+        t->sel_l0 = line; t->sel_c0 = col;
+        t->sel_l1 = line; t->sel_c1 = col;
+        t->sel_active = 1;
+    } else {
+        t->sel_l1 = line; t->sel_c1 = col;
+        if (t->sel_l0 == t->sel_l1 && t->sel_c0 == t->sel_c1)
+            t->sel_active = 0;
+        else
+            gui_copy(t);
+    }
+    t->dirty = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* event loop                                                         */
+/* ------------------------------------------------------------------ */
+
+static void gui_init(void)
+{
+    int screen;
+    XGCValues v;
+    unsigned long mask;
+    Window win;
+
+    g_dpy = XOpenDisplay(NULL);
+    if (!g_dpy) {
+        fprintf(stderr, "%s: cannot open display\n", APP_NAME);
+        exit(1);
+    }
+    screen = DefaultScreen(g_dpy);
+    g_scr = screen;
+
+    win = XCreateSimpleWindow(g_dpy, RootWindow(g_dpy, screen), 60, 60,
+                              WIN_W, WIN_H, 2, BlackPixel(g_dpy, screen),
+                              BlackPixel(g_dpy, screen));
+    g_win = win;
+
+    XSelectInput(g_dpy, win,
+                 ExposureMask | KeyPressMask | ButtonPressMask |
+                 ButtonReleaseMask | PointerMotionMask | StructureNotifyMask |
+                 EnterWindowMask);
+
+    g_wm_delete = XInternAtom(g_dpy, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(g_dpy, win, &g_wm_delete, 1);
+    XStoreName(g_dpy, win, "Terminator");
+
+    g_font = XLoadQueryFont(g_dpy, "fixed");
+    if (!g_font)
+        g_font = XLoadQueryFont(g_dpy, "6x13");
+    if (!g_font) {
+        fprintf(stderr, "%s: cannot load a font\n", APP_NAME);
+        exit(1);
+    }
+    g_cw = g_font->max_bounds.width;
+    if (g_cw <= 0) g_cw = 8;
+    g_ch = LINE_HEIGHT;
+    if (g_font->ascent + g_font->descent + 2 > g_ch)
+        g_ch = g_font->ascent + g_font->descent + 2;
+
+    memset(&v, 0, sizeof v);
+    v.foreground = WhitePixel(g_dpy, screen);   /* white text ... */
+    v.background = BlackPixel(g_dpy, screen);   /* ... on black */
+    v.font = g_font->fid;
+    mask = GCForeground | GCBackground | GCFont;
+    g_gc = XCreateGC(g_dpy, win, mask, &v);
+
+    g_clipboard = XInternAtom(g_dpy, "CLIPBOARD", False);
+    g_utf8 = XInternAtom(g_dpy, "UTF8_STRING", False);
+    g_targets = XInternAtom(g_dpy, "TARGETS", False);
+    g_text_atom = XInternAtom(g_dpy, "TEXT", False);
+    g_paste_prop = XInternAtom(g_dpy, "TERMINATOR_PASTE", False);
+
+    g_cursor = XCreateFontCursor(g_dpy, XC_xterm);
+    {
+        /* make the text cursor visible on the black background */
+        XColor fg, bg;
+        memset(&fg, 0, sizeof fg);
+        memset(&bg, 0, sizeof bg);
+        fg.pixel = WhitePixel(g_dpy, screen);
+        bg.pixel = BlackPixel(g_dpy, screen);
+        XQueryColor(g_dpy, DefaultColormap(g_dpy, screen), &fg);
+        XQueryColor(g_dpy, DefaultColormap(g_dpy, screen), &bg);
+        XRecolorCursor(g_dpy, g_cursor, &fg, &bg);
+    }
+    XDefineCursor(g_dpy, win, g_cursor);
+
+    XMapWindow(g_dpy, win);
+    XFlush(g_dpy);
+
+    {
+        XEvent ev;
+        do { XNextEvent(g_dpy, &ev); } while (ev.type != MapNotify);
+    }
+    XSetInputFocus(g_dpy, win, RevertToParent, CurrentTime);
+}
+
+static void gui_run(void)
+{
+    gui_init();
+
+    if (gui_new_tab() < 0) {
+        fprintf(stderr, "%s: cannot create initial tab\n", APP_NAME);
+        exit(1);
+    }
+
+    gui_draw();
+
+    while (g_running) {
+        struct pollfd pf[MAX_TABS * 2 + 2];
+        int idx[MAX_TABS * 2 + 2];
+        int nf = 0, i, r;
+
+        pf[nf].fd = ConnectionNumber(g_dpy);
+        pf[nf].events = POLLIN;
+        idx[nf] = -1;
+        nf++;
+
+        for (i = 0; i < g_tab_count; i++) {
+            if (g_tabs[i].out_r >= 0) {
+                pf[nf].fd = g_tabs[i].out_r; pf[nf].events = POLLIN; idx[nf] = i * 2; nf++;
+            }
+            if (g_tabs[i].ctl_r >= 0) {
+                pf[nf].fd = g_tabs[i].ctl_r; pf[nf].events = POLLIN; idx[nf] = i * 2 + 1; nf++;
+            }
+        }
+
+        r = poll(pf, (nfds_t)nf, -1);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
             break;
+        }
 
-        case ButtonPress:
-            if (ev.xbutton.button == Button4)
-                scroll_offset += 3;
-            else if (ev.xbutton.button == Button5)
-                scroll_offset -= 3;
-
-            draw_terminal(win, gc, cmd, len);
-            break;
-
-        case KeyPress: {
-            char text[32];
-            KeySym key;
-            int n = XLookupString(&ev.xkey, text,
-                                  sizeof(text), &key, NULL);
-
-            if (key == XK_Return || key == XK_KP_Enter) {
-                if ((ev.xkey.state & ShiftMask) ||
-                    quotes_balanced(cmd)) {
-                    if (len < MAX_CMD - 1) {
-                        cmd[len++] = '\n';
-                        cmd[len] = '\0';
+        /* Process X events.  We pull from the socket only when poll() says it
+         * is readable, and otherwise drain events Xlib has already buffered.
+         * XEventsQueued(QueuedAlready) never reads from the connection, so the
+         * GUI can never block here. */
+        {
+            int have_x = (pf[0].revents & POLLIN) != 0;
+            if (!have_x && XEventsQueued(g_dpy, QueuedAlready) > 0)
+                have_x = 1;
+            while (have_x) {
+                XEvent ev;
+                XNextEvent(g_dpy, &ev);
+                switch (ev.type) {
+                case Expose:
+                    if (ev.xexpose.count == 0)
+                        g_tabs[g_active].dirty = 1;
+                    break;
+                case ConfigureNotify:
+                    g_win_w = ev.xconfigure.width;
+                    g_win_h = ev.xconfigure.height;
+                    g_tabs[g_active].dirty = 1;
+                    break;
+                case ClientMessage:
+                    if ((Atom)ev.xclient.data.l[0] == g_wm_delete)
+                        g_running = 0;
+                    break;
+                case KeyPress:
+                    gui_handle_key(&ev.xkey);
+                    break;
+                case ButtonPress:
+                    if (ev.xbutton.button == Button4) {
+                        g_tabs[g_active].scroll += 3;
+                        g_tabs[g_active].dirty = 1;
+                    } else if (ev.xbutton.button == Button5) {
+                        g_tabs[g_active].scroll -= 3;
+                        if (g_tabs[g_active].scroll < 0) g_tabs[g_active].scroll = 0;
+                        g_tabs[g_active].dirty = 1;
+                    } else if (ev.xbutton.button == Button1) {
+                        if (ev.xbutton.y < TAB_HEIGHT)
+                            gui_tabbar_click(ev.xbutton.x, ev.xbutton.y);
+                        else
+                            gui_mouse_text(&g_tabs[g_active], ev.xbutton.x,
+                                           ev.xbutton.y, 0);
+                    } else if (ev.xbutton.button == Button2) {
+                        gui_request_paste(g_active, XA_PRIMARY);
                     }
-                } else {
-                    char command[MAX_CMD];
-                    snprintf(command, sizeof(command), "%s", cmd);
-
-                    char *line = cmd;
-                    char *next;
-
-                    do {
-                        next = strchr(line, '\n');
-                        if (next)
-                            *next = '\0';
-
-                        char prompt[MAX_LINE_LEN];
-                        snprintf(prompt, sizeof(prompt), "%s%s",
-                                 line == cmd ? "$ " : "> ", line);
-                        add_line(prompt);
-
-                        if (!next)
-                            break;
-
-                        line = next + 1;
-                    } while (1);
-
-                    if (len)
-                        execute_command(command);
-
-                    len = 0;
-                    cmd[0] = '\0';
-                    scroll_offset = 0;
+                    break;
+                case ButtonRelease:
+                    if (ev.xbutton.button == Button1 && ev.xbutton.y >= TAB_HEIGHT)
+                        gui_mouse_text(&g_tabs[g_active], ev.xbutton.x,
+                                       ev.xbutton.y, 1);
+                    break;
+                case MotionNotify:
+                    if (ev.xmotion.y >= TAB_HEIGHT && ev.xmotion.state & Button1Mask)
+                        gui_mouse_text(&g_tabs[g_active], ev.xmotion.x,
+                                       ev.xmotion.y, 0);
+                    break;
+                case SelectionRequest:
+                    handle_selection_request(&ev.xselectionrequest);
+                    break;
+                case SelectionNotify:
+                    handle_selection_notify(&ev.xselection);
+                    break;
+                default:
+                    break;
                 }
-            } else if (key == XK_BackSpace ||
-                       key == XK_Delete) {
-                if (len > 0)
-                    cmd[--len] = '\0';
-
-                scroll_offset = 0;
-            } else if (n > 0 && text[0] >= 32 &&
-                       text[0] <= 126) {
-                if (len < MAX_CMD - 1) {
-                    cmd[len++] = text[0];
-                    cmd[len] = '\0';
-                }
-
-                scroll_offset = 0;
+                have_x = XEventsQueued(g_dpy, QueuedAlready) > 0;
             }
+        }
 
-            draw_terminal(win, gc, cmd, len);
-            break;
+        /* process pipe data */
+        {
+            int tabs_before = g_tab_count;
+            for (i = 1; i < nf; i++) {
+                int t;
+                if (!(pf[i].revents & (POLLIN | POLLHUP | POLLERR)))
+                    continue;
+                t = idx[i] / 2;
+                if (t < 0 || t >= g_tab_count)
+                    continue;
+                if (idx[i] % 2 == 0)
+                    gui_read_output(t);
+                else
+                    gui_read_ctl(t);
+                if (!g_running)
+                    break;
+                if (g_tab_count != tabs_before)
+                    break;              /* indices moved: re-poll */
+            }
         }
-        }
+
+        for (i = 0; i < g_tab_count; i++)
+            if (g_tabs[i].dirty) {
+                g_tabs[i].dirty = 0;
+                gui_draw();
+                break;
+            }
     }
 
-    XFreeGC(dpy, gc);
+    /* shut the workers down cleanly */
+    for (int ci = 0; ci < g_tab_count; ci++) {
+        Tab *t = &g_tabs[ci];
+        int k;
+        if (g_sh[ci]) {
+            if (g_sh[ci]->fg_pgid > 0) kill(-g_sh[ci]->fg_pgid, SIGHUP);
+            if (g_sh[ci]->mw_active && g_sh[ci]->mw_pgid > 0)
+                kill(-g_sh[ci]->mw_pgid, SIGINT);
+        }
+        if (g_mode == MODE_PROCESS && t->pid > 0)
+            kill(t->pid, SIGTERM);
+        if (t->in_w >= 0) close(t->in_w);
+        if (t->out_r >= 0) close(t->out_r);
+        if (t->ctl_r >= 0) close(t->ctl_r);
+        for (k = 0; k < t->nlines; k++)
+            free(t->lines[k]);
+        free(t->lines);
+    }
 }
 
-int main(void)
+/* ------------------------------------------------------------------ */
+/* main                                                               */
+/* ------------------------------------------------------------------ */
+
+int main(int argc, char **argv)
 {
-    if ((dpy = XOpenDisplay(NULL)) == NULL)
-        err(1, "Can't open display");
+    int i;
 
-    scr = DefaultScreen(dpy);
-    root = RootWindow(dpy, scr);
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "useProcess=True"))
+            g_mode = MODE_PROCESS;
+    }
 
-    Window win = create_win(POSX, POSY, WIDTH, HEIGHT, BORDER);
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGCHLD, SIG_DFL);
 
-    run(win);
+    history_init(g_mode);
+    bindings_init();
+    bindings_load(config_path(), 0);
 
-    XUnmapWindow(dpy, win);
-    XDestroyWindow(dpy, win);
-    XCloseDisplay(dpy);
+    gui_run();
 
-    return last_status;
+    XFreeGC(g_dpy, g_gc);
+    if (g_font) XFreeFont(g_dpy, g_font);
+    if (g_cursor) XFreeCursor(g_dpy, g_cursor);
+    XDestroyWindow(g_dpy, g_win);
+    XCloseDisplay(g_dpy);
+
+    return 0;
 }
-
