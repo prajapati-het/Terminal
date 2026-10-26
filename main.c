@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <glob.h>
+#include <dirent.h>
 #include <time.h>
 #include <limits.h>
 #include <strings.h>
@@ -53,7 +54,9 @@
 #define MAX_STAGES      64
 #define MAX_LINE_LEN    4096
 #define MAX_SCROLLBACK  4000
-#define HIST_MAX        1000
+#define HIST_MAX        10000       /* commands kept, in memory and on disk */
+#define HIST_SHOW       1000        /* how many `history` prints */
+#define HIST_SCAN       2000        /* how many entries Ctrl+R scans */
 #define HIST_ENTRY      2048
 #define LINE_HEIGHT     18
 #define TAB_HEIGHT      30
@@ -63,7 +66,12 @@
 #define SEP_LEN         52          /* length of the multiWatch dash rule */
 #define MW_INTERVAL     2           /* multiWatch / watch re-run period (s) */
 #define MAX_JOBS        32
-#define JOB_CMD_LEN     256
+#define JOB_CMD_LEN     512
+
+/* job states */
+#define JOB_RUNNING     0
+#define JOB_DONE        1
+#define JOB_STOPPED     2
 
 #define MODE_THREAD     0
 #define MODE_PROCESS    1
@@ -153,6 +161,15 @@ typedef struct {
     /* mouse selection (display coordinates) */
     int    sel_active;
     int    sel_l0, sel_c0, sel_l1, sel_c1;
+    /* Ctrl+R search prompt */
+    int    searching;
+    char   search_buf[512];
+    int    search_len;
+    /* Tab-completion chooser */
+    int    choosing;
+    int    nchoices;
+    char   choices[64][PATH_MAX];
+    int    wstart, wend;
 } Tab;
 
 typedef enum {
@@ -162,7 +179,8 @@ typedef enum {
     ACT_KILL_START, ACT_KILL_END, ACT_KILL_WORD,
     ACT_CLEAR, ACT_EXIT, ACT_INTERRUPT, ACT_COPY, ACT_PASTE,
     ACT_NEW_TAB, ACT_CLOSE_TAB, ACT_NEXT_TAB, ACT_PREV_TAB,
-    ACT_PAGE_UP, ACT_PAGE_DOWN
+    ACT_PAGE_UP, ACT_PAGE_DOWN,
+    ACT_SUSPEND, ACT_SEARCH, ACT_COMPLETE
 } Action;
 
 typedef struct {
@@ -192,6 +210,7 @@ static pthread_mutex_t g_cwd_mtx = PTHREAD_MUTEX_INITIALIZER;
 TSTATIC Job   g_jobs[MAX_JOBS];
 TSTATIC int   g_job_count = 0;
 TSTATIC int   g_next_job_id = 1;
+TSTATIC char  g_cur_cmd[JOB_CMD_LEN];  /* command line of the job being run */
 
 /* GUI-private */
 static Display     *g_dpy = NULL;
@@ -233,6 +252,8 @@ static void history_init(int mode);
 static void history_add(const char *cmd);
 static int  history_count(void);
 static int  history_get(int i, char *buf, size_t cap);
+static void history_load_file(void);
+static void history_clear_all(void);
 
 static int  lex(const char *src, Token *toks, int max, char *err, size_t errcap);
 static int  lex_core(const char *src, Token *toks, int max, char *err, size_t errcap, int reset);
@@ -245,15 +266,18 @@ static int  is_redir_op(const Token *t);
 static void execute_line(const char *line);
 static void execute_tokens(Token *toks, int nt);
 static void run_one(Token *toks, int nt);
-static int  run_pipeline(Stage *st, int n, int term_out, char *result, size_t cap);
+static int  run_pipeline(Stage *st, int n);
 static void child_exec(Stage *st, int in_fd, int out_fd, int term_out, pid_t pgid,
                        const char *e_notfound, const char *e_noperm, const char *e_cannot);
 static int  open_redirections(Stage *st);
 static void expand_globs(Stage *st);
 static int  glob_in_cwd(const char *pat, glob_t *g);
-static void wait_foreground(pid_t *pids, int n);
+static int  wait_foreground(pid_t *pids, int n);
 static void reap_background_jobs(void);
 static int  run_capture(const char *cmd, char *out, size_t cap);
+static int  job_add(pid_t *pids, int n, pid_t pgid, const char *cmd, int state, int bg);
+static int  job_pick(const char *spec, int *idx_out);
+static const char *job_state_str(int st);
 
 static int  is_builtin(const char *name);
 static int  run_builtin_parent(char **args, int argc);
@@ -282,6 +306,10 @@ static void gui_draw(void);
 static void gui_handle_key(XKeyEvent *ke);
 static void gui_append_output(Tab *t, const char *data, int n, int idx);
 static void tab_append_line(Tab *t, const char *s);
+static void gui_suspend(Tab *t, int idx);
+static void gui_complete(Tab *t, int idx);
+static int  lcs_len(const char *a, const char *b);
+static void history_search(Tab *t, const char *term);
 
 /* ------------------------------------------------------------------ */
 /* small utilities                                                    */
@@ -360,14 +388,30 @@ static void history_init(int mode)
     g_hist->head  = 0;
 }
 
-static void history_add(const char *cmd)
+/* path of the shared history file, e.g. ~/.terminator_history */
+static const char *history_path(void)
+{
+    static char p[PATH_MAX];
+    const char *h = getenv("HOME");
+    snprintf(p, sizeof p, "%s/.terminator_history", h ? h : ".");
+    return p;
+}
+
+/* append one command to the history file (called with the semaphore held) */
+static void hist_file_append(const char *cmd)
+{
+    int fd = open(history_path(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0)
+        return;
+    write_all(fd, cmd, strlen(cmd));
+    write_all(fd, "\n", 1);
+    close(fd);
+}
+
+/* add to the in-memory ring; caller holds the semaphore */
+static void hist_push(const char *cmd)
 {
     int idx;
-
-    if (!g_hist || !cmd || !*cmd)
-        return;
-
-    sem_wait(&g_hist->sem);
 
     if (g_hist->count < HIST_MAX) {
         idx = (g_hist->head + g_hist->count) % HIST_MAX;
@@ -377,8 +421,80 @@ static void history_add(const char *cmd)
         g_hist->head = (g_hist->head + 1) % HIST_MAX;
     }
     snprintf(g_hist->entries[idx], HIST_ENTRY, "%s", cmd);
+}
 
+static void history_add(const char *cmd)
+{
+    if (!g_hist || !cmd || !*cmd)
+        return;
+
+    sem_wait(&g_hist->sem);
+    hist_push(cmd);
+    hist_file_append(cmd);
     sem_post(&g_hist->sem);
+}
+
+/* load the history file at start-up, keeping only the last HIST_MAX lines */
+static void history_load_file(void)
+{
+    FILE *f;
+    char line[HIST_ENTRY];
+    long nread = 0;
+    int rewrite = 0;
+
+    if (!g_hist)
+        return;
+
+    f = fopen(history_path(), "r");
+    if (!f)
+        return;
+
+    while (fgets(line, sizeof line, f)) {
+        size_t L = strlen(line);
+        while (L && (line[L - 1] == '\n' || line[L - 1] == '\r'))
+            line[--L] = '\0';
+        if (!L)
+            continue;
+        sem_wait(&g_hist->sem);
+        hist_push(line);
+        sem_post(&g_hist->sem);
+        nread++;
+    }
+    fclose(f);
+
+    if (nread > HIST_MAX)
+        rewrite = 1;                 /* the file grew past the cap: trim it */
+
+    if (rewrite) {
+        int i, total;
+        int fd = open(history_path(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0)
+            return;
+        sem_wait(&g_hist->sem);
+        total = g_hist->count;
+        for (i = 0; i < total; i++) {
+            write_all(fd, g_hist->entries[(g_hist->head + i) % HIST_MAX],
+                      strlen(g_hist->entries[(g_hist->head + i) % HIST_MAX]));
+            write_all(fd, "\n", 1);
+        }
+        sem_post(&g_hist->sem);
+        close(fd);
+    }
+}
+
+/* clear both the ring and the file */
+static void history_clear_all(void)
+{
+    if (!g_hist)
+        return;
+    sem_wait(&g_hist->sem);
+    g_hist->count = 0;
+    g_hist->head = 0;
+    sem_post(&g_hist->sem);
+    if (truncate(history_path(), 0) < 0) {
+        int fd = open(history_path(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) close(fd);
+    }
 }
 
 static int history_count(void)
@@ -987,7 +1103,9 @@ static void child_exec(Stage *st, int in_fd, int out_fd, int term_out, pid_t pgi
     }
     if (!strcmp(st->args[0], "history")) {
         char b[HIST_ENTRY];
-        for (int i = 0; i < history_count(); i++)
+        int total = history_count();
+        int start = total > HIST_SHOW ? total - HIST_SHOW : 0;
+        for (int i = start; i < total; i++)
             if (history_get(i, b, sizeof b))
                 dprintf(STDOUT_FILENO, "%5d  %s\n", i + 1, b);
         _exit(0);
@@ -1012,26 +1130,117 @@ static void child_exec(Stage *st, int in_fd, int out_fd, int term_out, pid_t pgi
     }
 }
 
-static void wait_foreground(pid_t *pids, int n)
+/*
+ * Wait for a foreground job.  WUNTRACED makes a stopped child (Ctrl+Z) report
+ * back immediately instead of blocking, so the shell can return to the prompt.
+ * Returns 1 if the job was stopped, 0 if it finished.
+ */
+static int wait_foreground(pid_t *pids, int n)
 {
-    int i, st;
+    int i, st, stopped = 0;
 
     for (i = 0; i < n; i++) {
-        while (waitpid(pids[i], &st, 0) < 0) {
+        st = -1;
+        while (waitpid(pids[i], &st, WUNTRACED) < 0) {
             if (errno == EINTR)
                 continue;
-            st = -1;
-            break;
+            break;                 /* ECHILD: already reaped */
         }
+        if (st != -1 && WIFSTOPPED(st))
+            stopped = 1;
         if (i == n - 1) {
             if (st != -1 && WIFEXITED(st))
                 g_last_status = WEXITSTATUS(st);
             else if (st != -1 && WIFSIGNALED(st))
                 g_last_status = 128 + WTERMSIG(st);
+            else if (st != -1 && WIFSTOPPED(st))
+                g_last_status = 128 + WSTOPSIG(st);
             else
                 g_last_status = 1;
         }
     }
+    return stopped;
+}
+
+static const char *job_state_str(int st)
+{
+    return st == JOB_STOPPED ? "Stopped" : st == JOB_DONE ? "Done" : "Running";
+}
+
+static int job_add(pid_t *pids, int n, pid_t pgid, const char *cmd, int state, int bg)
+{
+    Job *jb;
+
+    if (g_job_count >= MAX_JOBS)
+        return 0;
+    jb = &g_jobs[g_job_count++];
+    memset(jb, 0, sizeof *jb);
+    jb->id = g_next_job_id++;
+    jb->pgid = pgid;
+    jb->npids = n > MAX_STAGES ? MAX_STAGES : n;
+    for (int i = 0; i < jb->npids; i++)
+        jb->pids[i] = pids[i];
+    jb->state = state;
+    jb->bg = bg;
+    snprintf(jb->cmd, sizeof jb->cmd, "%s", cmd ? cmd : "");
+    /* store the command without a trailing '&' so listings can add their own */
+    {
+        int L = (int)strlen(jb->cmd);
+        while (L > 0 && isspace((unsigned char)jb->cmd[L - 1]))
+            L--;
+        if (L > 0 && jb->cmd[L - 1] == '&') {
+            L--;
+            while (L > 0 && isspace((unsigned char)jb->cmd[L - 1]))
+                L--;
+        }
+        jb->cmd[L] = '\0';
+    }
+    return jb->id;
+}
+
+/*
+ * Resolve a job spec: NULL/""/"%"/"%+" = current, "%-" = previous,
+ * "%N" or "N" = job N.  Returns the job id (or 0) and its table index.
+ */
+static int job_pick(const char *spec, int *idx_out)
+{
+    int want, best = -1, prev = -1, i;
+
+    *idx_out = -1;
+
+    if (!spec || !*spec || !strcmp(spec, "%") || !strcmp(spec, "%+"))
+        want = -2;
+    else if (!strcmp(spec, "%-"))
+        want = -3;
+    else if (spec[0] == '%')
+        want = atoi(spec + 1);
+    else
+        want = atoi(spec);
+
+    for (i = 0; i < g_job_count; i++) {
+        if (g_jobs[i].state == JOB_DONE)
+            continue;
+        if (best < 0 || g_jobs[i].id > g_jobs[best].id) { prev = best; best = i; }
+        else if (prev < 0 || g_jobs[i].id > g_jobs[prev].id) { prev = i; }
+    }
+
+    if (want == -2) {
+        if (best < 0) return 0;
+        *idx_out = best;
+        return g_jobs[best].id;
+    }
+    if (want == -3) {
+        if (prev < 0) return 0;
+        *idx_out = prev;
+        return g_jobs[prev].id;
+    }
+    for (i = 0; i < g_job_count; i++) {
+        if (g_jobs[i].id == want && g_jobs[i].state != JOB_DONE) {
+            *idx_out = i;
+            return g_jobs[i].id;
+        }
+    }
+    return 0;
 }
 
 static void reap_background_jobs(void)
@@ -1058,36 +1267,30 @@ static void reap_background_jobs(void)
 }
 
 /*
- * Run a pipeline.  If term_out is set the final stage's stdout/stderr is
- * captured and handed to the tab.  If result is non-NULL the captured text
- * is returned there (used by command substitution).
+ * Run a pipeline.  Every child inherits the tab's output pipe directly (its
+ * stdout and stderr are pointed at g_out_fd), so the worker never has to sit
+ * in read() while a child runs -- which is what lets a stopped child (Ctrl+Z)
+ * be noticed immediately instead of deadlocking.
  */
-static int run_pipeline(Stage *st, int n, int term_out, char *result, size_t cap)
+static int run_pipeline(Stage *st, int n)
 {
     int pipes[MAX_STAGES][2];
     pid_t pids[MAX_STAGES];
-    int capture[2] = { -1, -1 };
     int npipes = n - 1;
     int background = st[n - 1].background;
     int i;
-
-    if (result)
-        result[0] = '\0';
 
     for (i = 0; i < n; i++)
         expand_globs(&st[i]);
 
     /* single, unadorned builtin runs in the worker itself so that it can
      * change the shell's own state (cwd, history, jobs, ...) */
-    if (result == NULL && !background && n == 1 && !st[0].input &&
-        !st[0].output && !st[0].error && is_builtin(st[0].args[0])) {
+    if (!background && n == 1 && !st[0].input && !st[0].output &&
+        !st[0].error && is_builtin(st[0].args[0])) {
         int r = run_builtin_parent(st[0].args, st[0].argc);
         free_stage_args(st, n);
         return r;
     }
-
-    if (background)
-        term_out = 0;
 
     for (i = 0; i < npipes; i++) {
         if (pipe(pipes[i]) < 0) {
@@ -1099,22 +1302,11 @@ static int run_pipeline(Stage *st, int n, int term_out, char *result, size_t cap
         }
     }
 
-    if (term_out) {
-        if (pipe(capture) < 0) {
-            emit("%s: pipe: %s\n", APP_NAME, strerror(errno));
-            for (i = 0; i < npipes; i++) { close(pipes[i][0]); close(pipes[i][1]); }
-            g_last_status = 1;
-            free_stage_args(st, n);
-            return 0;
-        }
-    }
-
     for (i = 0; i < n; i++) {
         pid_t pid = fork();
         if (pid < 0) {
             emit("%s: fork: %s\n", APP_NAME, strerror(errno));
             for (int j = 0; j < npipes; j++) { close(pipes[j][0]); close(pipes[j][1]); }
-            if (term_out) { close(capture[0]); close(capture[1]); }
             for (int j = 0; j < i; j++) {
                 kill(pids[j], SIGKILL);
                 waitpid(pids[j], NULL, 0);
@@ -1133,10 +1325,8 @@ static int run_pipeline(Stage *st, int n, int term_out, char *result, size_t cap
                 if (j != i - 1) close(pipes[j][0]);
                 if (j != i) close(pipes[j][1]);
             }
-            if (term_out)
-                close(capture[0]);
 
-            child_exec(&st[i], in, out, term_out, pg,
+            child_exec(&st[i], in, out, 1, pg,
                        APP_NAME, APP_NAME, APP_NAME);
             _exit(127);
         }
@@ -1146,25 +1336,13 @@ static int run_pipeline(Stage *st, int n, int term_out, char *result, size_t cap
     }
 
     for (i = 0; i < npipes; i++) { close(pipes[i][0]); close(pipes[i][1]); }
-    if (term_out)
-        close(capture[1]);
 
     if (background) {
-        if (g_job_count < MAX_JOBS) {
-            Job *jb = &g_jobs[g_job_count++];
-            memset(jb, 0, sizeof *jb);
-            jb->id = g_next_job_id++;
-            jb->pgid = pids[0];
-            jb->npids = n;
-            for (i = 0; i < n; i++)
-                jb->pids[i] = pids[i];
-            jb->state = 0;
-            jb->bg = 1;
-            snprintf(jb->cmd, sizeof jb->cmd, "%s", st[0].args[0]);
-            emit("[%d] %d\n", jb->id, (int)pids[0]);
-        } else {
+        int id = job_add(pids, n, pids[0], g_cur_cmd, JOB_RUNNING, 1);
+        if (id)
+            emit("[%d] %d\n", id, (int)pids[0]);
+        else
             emit("%s: too many background jobs\n", APP_NAME);
-        }
         g_last_status = 0;
         free_stage_args(st, n);
         return 1;
@@ -1173,32 +1351,12 @@ static int run_pipeline(Stage *st, int n, int term_out, char *result, size_t cap
     if (g_sh_self)
         g_sh_self->fg_pgid = pids[0];
 
-    if (result) {
-        size_t len = 0;
-        char buf[1024];
-        ssize_t nr;
-        while ((nr = read(capture[0], buf, sizeof buf)) != 0) {
-            if (nr < 0) { if (errno == EINTR) continue; break; }
-            if (len + (size_t)nr < cap - 1) {
-                memcpy(result + len, buf, (size_t)nr);
-                len += (size_t)nr;
-            }
-        }
-        result[len] = '\0';
-        while (len > 0 && (result[len - 1] == '\n' || result[len - 1] == '\r'))
-            result[--len] = '\0';
-        close(capture[0]);
-    } else if (term_out) {
-        char buf[4096];
-        ssize_t nr;
-        while ((nr = read(capture[0], buf, sizeof buf)) != 0) {
-            if (nr < 0) { if (errno == EINTR) continue; break; }
-            emit_raw(buf, (size_t)nr);
-        }
-        close(capture[0]);
+    if (wait_foreground(pids, n)) {
+        /* the job was stopped (Ctrl+Z): keep it around for fg/bg */
+        int id = job_add(pids, n, pids[0], g_cur_cmd, JOB_STOPPED, 1);
+        if (id)
+            emit("[%d]+  Stopped                 %s\n", id, g_cur_cmd);
     }
-
-    wait_foreground(pids, n);
 
     if (g_sh_self)
         g_sh_self->fg_pgid = 0;
@@ -1331,7 +1489,9 @@ static int run_builtin_parent(char **args, int argc)
     }
     if (!strcmp(c, "history")) {
         char b[HIST_ENTRY];
-        for (int i = 0; i < history_count(); i++)
+        int total = history_count();
+        int start = total > HIST_SHOW ? total - HIST_SHOW : 0;
+        for (int i = start; i < total; i++)
             if (history_get(i, b, sizeof b))
                 emit("%5d  %s\n", i + 1, b);
         g_last_status = 0;
@@ -1351,32 +1511,55 @@ static int run_builtin_parent(char **args, int argc)
         return 1;
     }
     if (!strcmp(c, "jobs")) {
-        for (int i = 0; i < g_job_count; i++)
-            if (g_jobs[i].state == 0)
-                emit("[%d]  running  %s\n", g_jobs[i].id, g_jobs[i].cmd);
+        int best = -1, prev = -1, i;
+        for (i = 0; i < g_job_count; i++) {
+            if (g_jobs[i].state == JOB_DONE) continue;
+            if (best < 0 || g_jobs[i].id > g_jobs[best].id) { prev = best; best = i; }
+            else if (prev < 0 || g_jobs[i].id > g_jobs[prev].id) { prev = i; }
+        }
+        for (i = 0; i < g_job_count; i++) {
+            Job *jb = &g_jobs[i];
+            char m;
+            if (jb->state == JOB_DONE) continue;
+            m = (i == best) ? '+' : (i == prev) ? '-' : ' ';
+            emit("[%d]%c  %-24s%s%s\n", jb->id, m, job_state_str(jb->state),
+                 jb->cmd, (jb->bg && jb->state == JOB_RUNNING) ? " &" : "");
+        }
         g_last_status = 0;
         return 1;
     }
     if (!strcmp(c, "bg")) {
-        int id = argc > 1 ? atoi(args[1]) : -1;
-        for (int i = 0; i < g_job_count; i++)
-            if (g_jobs[i].state == 0 && (id < 0 || g_jobs[i].id == id)) {
-                kill(-g_jobs[i].pgid, SIGCONT);
-                emit("[%d] %s &\n", g_jobs[i].id, g_jobs[i].cmd);
-            }
+        int ix;
+        if (job_pick(argc > 1 ? args[1] : NULL, &ix) == 0) {
+            emit("%s: bg: no such job\n", APP_NAME);
+            g_last_status = 1;
+            return 1;
+        }
+        kill(-g_jobs[ix].pgid, SIGCONT);
+        g_jobs[ix].state = JOB_RUNNING;
+        g_jobs[ix].bg = 1;
+        emit("[%d]+ %s &\n", g_jobs[ix].id, g_jobs[ix].cmd);
         g_last_status = 0;
         return 1;
     }
     if (!strcmp(c, "fg")) {
-        int id = argc > 1 ? atoi(args[1]) : -1;
-        for (int i = 0; i < g_job_count; i++)
-            if (g_jobs[i].state == 0 && (id < 0 || g_jobs[i].id == id)) {
-                kill(-g_jobs[i].pgid, SIGCONT);
-                if (g_sh_self) g_sh_self->fg_pgid = g_jobs[i].pgid;
-                wait_foreground(g_jobs[i].pids, g_jobs[i].npids);
-                g_jobs[i].state = 1;
-                if (g_sh_self) g_sh_self->fg_pgid = 0;
-            }
+        int ix;
+        if (job_pick(argc > 1 ? args[1] : NULL, &ix) == 0) {
+            emit("%s: fg: no such job\n", APP_NAME);
+            g_last_status = 1;
+            return 1;
+        }
+        emit("%s\n", g_jobs[ix].cmd);
+        g_jobs[ix].bg = 0;
+        if (g_sh_self) g_sh_self->fg_pgid = g_jobs[ix].pgid;
+        kill(-g_jobs[ix].pgid, SIGCONT);
+        if (wait_foreground(g_jobs[ix].pids, g_jobs[ix].npids)) {
+            g_jobs[ix].state = JOB_STOPPED;
+            emit("[%d]+  Stopped                 %s\n", g_jobs[ix].id, g_jobs[ix].cmd);
+        } else {
+            g_jobs[ix].state = JOB_DONE;
+        }
+        if (g_sh_self) g_sh_self->fg_pgid = 0;
         return 1;
     }
     if (!strcmp(c, "clear")) {
@@ -1448,12 +1631,7 @@ static int run_builtin_parent(char **args, int argc)
             return 1;
         }
         if (!strcmp(sub, "history") && argc > 2 && !strcmp(args[2], "clear")) {
-            if (g_hist) {
-                sem_wait(&g_hist->sem);
-                g_hist->count = 0;
-                g_hist->head = 0;
-                sem_post(&g_hist->sem);
-            }
+            history_clear_all();
             emit("%s: history cleared\n", APP_NAME);
             g_last_status = 0;
             return 1;
@@ -1771,7 +1949,7 @@ static void run_one(Token *toks, int nt)
         g_last_status = 2;
         return;
     }
-    run_pipeline(st, nst, 1, NULL, 0);
+    run_pipeline(st, nst);
 }
 
 static void execute_tokens(Token *toks, int nt)
@@ -1832,6 +2010,9 @@ static void execute_line(const char *line)
         p++;
     if (!*p)
         return;
+
+    /* remember the command line for job listings (jobs/fg/bg, Ctrl+Z) */
+    snprintf(g_cur_cmd, sizeof g_cur_cmd, "%s", p);
 
     if (word_is(p, "multiWatch")) {
         history_add(line);
@@ -1930,7 +2111,10 @@ static void worker_loop(WorkerCtx *ctx)
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
+    /* Terminator itself must never stop */
     signal(SIGTSTP, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
 
     if (!g_cwd[0] && getcwd(g_cwd, sizeof g_cwd) == NULL)
         snprintf(g_cwd, sizeof g_cwd, "/");
@@ -2009,6 +2193,9 @@ static const char *action_name(Action a)
     case ACT_PREV_TAB: return "prev_tab";
     case ACT_PAGE_UP: return "page_up";
     case ACT_PAGE_DOWN: return "page_down";
+    case ACT_SUSPEND: return "suspend";
+    case ACT_SEARCH: return "search";
+    case ACT_COMPLETE: return "complete";
     default: return "none";
     }
 }
@@ -2024,6 +2211,8 @@ static Action action_from_name(const char *n)
         {"new_tab", ACT_NEW_TAB}, {"close_tab", ACT_CLOSE_TAB},
         {"next_tab", ACT_NEXT_TAB}, {"prev_tab", ACT_PREV_TAB},
         {"page_up", ACT_PAGE_UP}, {"page_down", ACT_PAGE_DOWN},
+        {"suspend", ACT_SUSPEND}, {"search", ACT_SEARCH},
+        {"complete", ACT_COMPLETE},
         {NULL, ACT_NONE}
     };
     for (int i = 0; tab[i].n; i++)
@@ -2107,6 +2296,9 @@ static void bindings_init(void)
     bindings_add_def(0, "Ctrl+Shift+Tab", ACT_PREV_TAB);
     bindings_add_def(0, "Page_Up", ACT_PAGE_UP);
     bindings_add_def(0, "Page_Down", ACT_PAGE_DOWN);
+    bindings_add_def(0, "Ctrl+Z", ACT_SUSPEND);
+    bindings_add_def(0, "Ctrl+R", ACT_SEARCH);
+    bindings_add_def(0, "Tab", ACT_COMPLETE);
 }
 
 static int bindings_add_user(const char *keyspec, const char *action, char *err, size_t cap)
@@ -2312,6 +2504,8 @@ static void gui_append_output(Tab *t, const char *data, int n, int idx)
 static int input_line_count(Tab *t)
 {
     int n = 1;
+    if (t->searching)
+        return 1;
     for (int i = 0; i < t->len; i++)
         if (t->input[i] == '\n')
             n++;
@@ -2322,6 +2516,9 @@ static int input_line_count(Tab *t)
 static int input_line_at(Tab *t, int m, char *buf, int cap)
 {
     int seg = 0, i = 0, len = 0;
+
+    if (t->searching)
+        return snprintf(buf, cap, "Enter search term: %s", t->search_buf);
 
     while (seg < m) {
         while (i < t->len && t->input[i] != '\n') i++;
@@ -2452,20 +2649,24 @@ static void gui_draw(void)
 
         /* cursor */
         if (t->awaiting && t->scroll == 0) {
-            int m = 0, segstart = 0, i2;
-            int cx, cy;
-            for (i2 = 0; i2 < t->cursor; i2++)
-                if (t->input[i2] == '\n') { m++; segstart = i2 + 1; }
-            {
-                char seg[MAX_CMD];
-                int sl = 0;
+            const char *prompt_str;
+            char seg[MAX_CMD];
+            int m = 0, segstart = 0, i2, sl = 0, cx, cy;
+
+            if (t->searching) {
+                prompt_str = "Enter search term: ";
+                snprintf(seg, sizeof seg, "%s", t->search_buf);
+                sl = (int)strlen(seg);
+            } else {
+                for (i2 = 0; i2 < t->cursor; i2++)
+                    if (t->input[i2] == '\n') { m++; segstart = i2 + 1; }
                 for (i2 = segstart; i2 < t->cursor; i2++)
                     seg[sl++] = t->input[i2];
                 seg[sl] = '\0';
-                cx = pad + text_width(m == 0 ? t->prompt : PROMPT_CONT,
-                                      (int)strlen(m == 0 ? t->prompt : PROMPT_CONT));
-                cx += text_width(seg, sl);
+                prompt_str = (m == 0) ? t->prompt : PROMPT_CONT;
             }
+            cx = pad + text_width(prompt_str, (int)strlen(prompt_str));
+            cx += text_width(seg, sl);
             cy = top + (t->nlines + (t->pending_len > 0 ? 1 : 0) + m - start) * g_ch;
             XSetForeground(g_dpy, g_gc, WhitePixel(g_dpy, g_scr));
             XDrawLine(g_dpy, g_win, g_gc, cx, cy, cx, cy + g_ch - 2);
@@ -2674,6 +2875,7 @@ static void gui_interrupt(Tab *t, int idx)
     t->len = 0;
     t->cursor = 0;
     t->hist_pos = -1;
+    t->choosing = 0;
     t->awaiting = had_job ? 0 : 1;
     t->dirty = 1;
 }
@@ -2705,8 +2907,280 @@ static void gui_submit(Tab *t, int idx)
     t->len = 0;
     t->cursor = 0;
     t->hist_pos = -1;
+    t->choosing = 0;
     t->awaiting = 0;
     t->dirty = 1;
+}
+
+/* ---------------- Ctrl+Z (Task 8) ---------------- */
+
+static void gui_suspend(Tab *t, int idx)
+{
+    Shared *sh = g_sh[idx];
+
+    if (!sh || sh->fg_pgid <= 0)
+        return;                       /* nothing running in the foreground */
+    kill(-sh->fg_pgid, SIGTSTP);      /* keys are X events: we send it ourselves */
+    tab_append_line(t, "^Z");
+    t->input[0] = '\0';
+    t->len = 0;
+    t->cursor = 0;
+    t->hist_pos = -1;
+    t->choosing = 0;
+    t->awaiting = 0;                  /* the worker prints Stopped + a new prompt */
+    t->dirty = 1;
+}
+
+/* ---------------- Ctrl+R search (Task 9) ---------------- */
+
+/* length of the longest common *substring* of a and b */
+static int lcs_len(const char *a, const char *b)
+{
+    int la = (int)strlen(a), lb = (int)strlen(b);
+    static int prev[513], cur[513];
+    int i, j, best = 0;
+
+    if (la > 512) la = 512;
+    if (lb > 512) lb = 512;
+    if (la == 0 || lb == 0)
+        return 0;
+
+    memset(prev, 0, sizeof(int) * (size_t)(lb + 1));
+    for (i = 1; i <= la; i++) {
+        cur[0] = 0;
+        for (j = 1; j <= lb; j++) {
+            if (a[i - 1] == b[j - 1]) {
+                cur[j] = prev[j - 1] + 1;
+                if (cur[j] > best) best = cur[j];
+            } else {
+                cur[j] = 0;
+            }
+        }
+        memcpy(prev, cur, sizeof(int) * (size_t)(lb + 1));
+    }
+    return best;
+}
+
+static void history_search(Tab *t, const char *term)
+{
+    char b[HIST_ENTRY];
+    int total = history_count();
+    int i, start;
+
+    if (total == 0 || !term || !*term) {
+        tab_append_line(t, "No match for search term in history");
+        return;
+    }
+
+    /* (a) the most recent command that exactly matches the term */
+    for (i = total - 1; i >= 0; i--) {
+        if (!history_get(i, b, sizeof b)) continue;
+        if (!strcmp(b, term)) { tab_append_line(t, b); return; }
+    }
+
+    /* (b) the command(s) sharing the longest common substring with the term,
+     *     if that match is longer than 2 characters */
+    start = total > HIST_SCAN ? total - HIST_SCAN : 0;
+    {
+        int best = 0;
+        for (i = start; i < total; i++) {
+            int L;
+            if (!history_get(i, b, sizeof b)) continue;
+            L = lcs_len(term, b);
+            if (L > best) best = L;
+        }
+        if (best > 2) {
+            for (i = total - 1; i >= start; i--) {
+                if (!history_get(i, b, sizeof b)) continue;
+                if (lcs_len(term, b) == best)
+                    tab_append_line(t, b);
+            }
+            return;
+        }
+    }
+
+    /* (c) nothing matched */
+    tab_append_line(t, "No match for search term in history");
+}
+
+/* keystrokes while the "Enter search term: " prompt is open */
+static void gui_search_key(Tab *t, KeySym ks, int ctrl, int alt, char *text, int n)
+{
+    if (ks == XK_Return || ks == XK_KP_Enter) {
+        char term[512], line[600];
+        snprintf(term, sizeof term, "%s", t->search_buf);
+        snprintf(line, sizeof line, "Enter search term: %s", term);
+        tab_append_line(t, line);
+        t->searching = 0;
+        t->search_buf[0] = '\0';
+        t->search_len = 0;
+        history_search(t, term);
+        t->dirty = 1;
+        return;
+    }
+    if (ks == XK_BackSpace || ks == XK_Delete) {
+        if (t->search_len > 0)
+            t->search_buf[--t->search_len] = '\0';
+        t->dirty = 1;
+        return;
+    }
+    if (ctrl && (ks == XK_c || ks == XK_g || ks == XK_r)) {
+        t->searching = 0;
+        t->search_buf[0] = '\0';
+        t->search_len = 0;
+        t->dirty = 1;
+        return;
+    }
+    if (!ctrl && !alt && n > 0) {
+        for (int i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)text[i];
+            if (c < 32 || c == 127) continue;
+            if (t->search_len < (int)sizeof t->search_buf - 1)
+                t->search_buf[t->search_len++] = (char)c;
+        }
+        t->search_buf[t->search_len] = '\0';
+        t->dirty = 1;
+    }
+}
+
+/* ---------------- Tab completion (Task 10) ---------------- */
+
+static void replace_word(Tab *t, int start, int end, const char *s)
+{
+    int sl = (int)strlen(s);
+
+    memmove(t->input + start + sl, t->input + end, (size_t)(t->len - end));
+    memcpy(t->input + start, s, (size_t)sl);
+    t->len = t->len - (end - start) + sl;
+    t->cursor = start + sl;
+    t->input[t->len] = '\0';
+}
+
+static void print_choice_list(Tab *t)
+{
+    char line[MAX_LINE_LEN];
+    int lp = 0, i;
+
+    line[0] = '\0';
+    for (i = 0; i < t->nchoices; i++) {
+        char item[PATH_MAX + 16];
+        int need;
+        snprintf(item, sizeof item, "%d. %s", i + 1, t->choices[i]);
+        need = (int)strlen(item) + (lp ? 1 : 0);
+        if (lp && lp + need > 76) {
+            tab_append_line(t, line);
+            lp = 0;
+            line[0] = '\0';
+        }
+        if (lp) { strcat(line, " "); lp++; }
+        strcat(line, item);
+        lp += (int)strlen(item);
+    }
+    if (lp)
+        tab_append_line(t, line);
+}
+
+static int cmp_str(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static void gui_complete(Tab *t, int idx)
+{
+    char word[MAX_CMD], dir[PATH_MAX], base[MAX_CMD], scan[PATH_MAX];
+    char *matches[64];
+    int nm = 0, i, ws, wl;
+    const char *cwd = g_tab_cwd[idx][0] ? g_tab_cwd[idx] : ".";
+    DIR *d;
+    struct dirent *de;
+
+    if (!t->awaiting || t->len >= MAX_CMD - 1)
+        return;
+
+    /* the word immediately before the cursor */
+    ws = t->cursor;
+    while (ws > 0 && !isspace((unsigned char)t->input[ws - 1]))
+        ws--;
+    wl = t->cursor - ws;
+    if (wl >= (int)sizeof word)
+        return;
+    memcpy(word, t->input + ws, (size_t)wl);
+    word[wl] = '\0';
+
+    /* allow a path prefix, though the brief only needs the current directory */
+    {
+        const char *slash = strrchr(word, '/');
+        if (slash) {
+            int dl = (int)(slash - word) + 1;
+            memcpy(dir, word, (size_t)dl);
+            dir[dl] = '\0';
+            snprintf(base, sizeof base, "%s", slash + 1);
+        } else {
+            dir[0] = '\0';
+            snprintf(base, sizeof base, "%s", word);
+        }
+    }
+
+    if (dir[0] == '/')
+        snprintf(scan, sizeof scan, "%s", dir);
+    else if (dir[0])
+        snprintf(scan, sizeof scan, "%s/%s", cwd, dir);
+    else
+        snprintf(scan, sizeof scan, "%s", cwd);
+
+    d = opendir(scan);
+    if (!d)
+        return;
+    while ((de = readdir(d)) != NULL && nm < 64) {
+        char full[PATH_MAX];
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        if (strncmp(de->d_name, base, strlen(base)))
+            continue;
+        snprintf(full, sizeof full, "%s%s", dir, de->d_name);
+        matches[nm++] = xstrdup(full);
+    }
+    closedir(d);
+
+    if (nm > 1)                       /* deterministic, bash-like order */
+        qsort(matches, (size_t)nm, sizeof(char *), cmp_str);
+
+    if (nm == 0) {                    /* no match: leave the line alone */
+        return;
+    }
+
+    if (nm == 1) {                    /* exactly one: complete it */
+        replace_word(t, ws, t->cursor, matches[0]);
+        free(matches[0]);
+        t->dirty = 1;
+        return;
+    }
+
+    /* several: extend to the longest common prefix ... */
+    {
+        char lcp[PATH_MAX];
+        snprintf(lcp, sizeof lcp, "%s", matches[0]);
+        for (i = 1; i < nm; i++) {
+            int k = 0;
+            while (lcp[k] && matches[i][k] && lcp[k] == matches[i][k])
+                k++;
+            lcp[k] = '\0';
+        }
+        if (strlen(lcp) > strlen(word))
+            replace_word(t, ws, t->cursor, lcp);
+
+        /* ... and it is still ambiguous: offer a numbered list */
+        t->choosing = 1;
+        t->nchoices = nm;
+        t->wstart = ws;
+        t->wend = t->cursor;
+        for (i = 0; i < nm; i++) {
+            snprintf(t->choices[i], sizeof t->choices[i], "%s", matches[i]);
+            free(matches[i]);
+        }
+        print_choice_list(t);
+        t->dirty = 1;
+    }
 }
 
 static void gui_do_action(Action a, Tab *t, int idx)
@@ -2742,6 +3216,17 @@ static void gui_do_action(Action a, Tab *t, int idx)
     case ACT_PREV_TAB:  if (g_tab_count > 1) { g_active = (g_active - 1 + g_tab_count) % g_tab_count; } break;
     case ACT_PAGE_UP:   g_tabs[g_active].scroll += 5; break;
     case ACT_PAGE_DOWN: g_tabs[g_active].scroll -= 5; if (g_tabs[g_active].scroll < 0) g_tabs[g_active].scroll = 0; break;
+    case ACT_SUSPEND:   gui_suspend(t, idx); return;
+    case ACT_SEARCH:
+        if (t->awaiting) {
+            t->searching = 1;
+            t->search_len = 0;
+            t->search_buf[0] = '\0';
+            t->choosing = 0;
+            t->dirty = 1;
+        }
+        return;
+    case ACT_COMPLETE:  gui_complete(t, idx); return;
     default: break;
     }
     g_tabs[g_active].dirty = 1;
@@ -2765,9 +3250,35 @@ static void gui_handle_key(XKeyEvent *ke)
     if (shift) mods |= ShiftMask;
     if (alt) mods |= Mod1Mask;
 
+    /* the Ctrl+R search prompt owns the keyboard while it is open */
+    if (t->searching) {
+        gui_search_key(t, ks, ctrl, alt, text, n);
+        gui_draw();
+        return;
+    }
+
     a = bindings_lookup(mods, ks);
     if (a != ACT_NONE) {
         gui_do_action(a, t, g_active);
+        gui_draw();
+        return;
+    }
+
+    /* the numbered completion chooser: a digit picks an entry */
+    if (t->choosing && t->awaiting) {
+        if (n > 0 && text[0] >= '1' && text[0] <= '9' &&
+            text[0] - '0' <= t->nchoices) {
+            int pick = text[0] - '0';
+            int nl = (int)strlen(t->choices[pick - 1]);
+            memmove(t->input + t->wstart + nl, t->input + t->wend,
+                    (size_t)(t->len - t->wend));
+            memcpy(t->input + t->wstart, t->choices[pick - 1], (size_t)nl);
+            t->len = t->wstart + nl + (t->len - t->wend);
+            t->cursor = t->wstart + nl;
+            t->input[t->len] = '\0';
+        }
+        t->choosing = 0;
+        t->dirty = 1;
         gui_draw();
         return;
     }
@@ -3368,9 +3879,14 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
+    /* the emulator itself must never be stopped or backgrounded */
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
     signal(SIGCHLD, SIG_DFL);
 
     history_init(g_mode);
+    history_load_file();
     bindings_init();
     bindings_load(config_path(), 0);
 
