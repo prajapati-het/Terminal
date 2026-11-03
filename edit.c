@@ -78,11 +78,18 @@ static void gui_interrupt(Tab *t, int idx)
 static void gui_submit(Tab *t, int idx)
 {
     char buf[MAX_LINE_LEN + 64];
-    char *p = t->input;
+    char copy[MAX_CMD];
+    char *p;
     int first = 1;
 
     (void)idx;
-    for (;;) {
+
+    /* Echo the line(s) from a COPY.  t->input must stay intact: the whole
+     * multi-line command is what goes to the worker.  Splitting the original
+     * in place would send only the first segment, so a quoted multi-line
+     * command arrived truncated and the worker reported "unmatched quote". */
+    snprintf(copy, sizeof copy, "%s", t->input);
+    for (p = copy;; first = 0) {
         char *nl = strchr(p, '\n');
         if (nl)
             *nl = '\0';
@@ -91,11 +98,20 @@ static void gui_submit(Tab *t, int idx)
         if (!nl)
             break;
         p = nl + 1;
-        first = 0;
     }
 
     if (t->in_w >= 0) {
-        write_all(t->in_w, t->input, strlen(t->input));
+        /* The in-pipe is line based: the worker reads up to a newline.  A
+         * multi-line command therefore has to travel with its embedded
+         * newlines escaped, or the worker would see one truncated command per
+         * line (and a quoted multi-line echo would report "unmatched quote"). */
+        char wire[MAX_CMD];
+        int k, n = t->len;
+
+        if (n > (int)sizeof wire - 1) n = (int)sizeof wire - 1;
+        for (k = 0; k < n; k++)
+            wire[k] = (t->input[k] == '\n') ? (char)NL_MARK : t->input[k];
+        write_all(t->in_w, wire, (size_t)n);
         write_all(t->in_w, "\n", 1);
     }
     t->input[0] = '\0';

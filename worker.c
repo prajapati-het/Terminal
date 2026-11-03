@@ -53,6 +53,10 @@ char *worker_read_command(void)
             buf[len++] = (char)c;
     }
     buf[len] = '\0';
+    /* undo the GUI's escaping: NL_MARK stands for a newline inside one command */
+    for (int k = 0; k < len; k++)
+        if ((unsigned char)buf[k] == NL_MARK)
+            buf[k] = '\n';
     return xstrdup(buf);
 }
 
@@ -114,4 +118,3 @@ void *worker_thread(void *p)
     worker_loop((WorkerCtx *)p);
     return NULL;
 }
-

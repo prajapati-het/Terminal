@@ -27,7 +27,15 @@ The program is split into two roles that talk to each other over pipes:
 
 Each tab therefore has three pipes: `in` (GUI → worker: completed command
 lines), `out` (worker → GUI: prompts and command output) and `ctl`
-(worker → GUI: out-of-band control messages). Because a worker only ever
+(worker → GUI: out-of-band control messages).
+
+The `in` pipe is line oriented — the worker reads up to a newline — but a
+command may legitimately *contain* newlines (a quoted string spanning lines, a
+`\` continuation). Those embedded newlines are escaped as `NL_MARK` (0x1e) on
+the way in and turned back into `\n` by `worker_read_command()`. Without that,
+`echo "Hello` + `World"` arrived at the worker as two separate commands and the
+first one was reported as `unmatched quote`. `NL_MARK` cannot collide with real
+input: control bytes are stripped from typed text and from pastes. Because a worker only ever
 writes bytes and the GUI only ever draws bytes, *the same worker code serves
 both execution modes*.
 

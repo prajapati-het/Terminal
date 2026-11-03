@@ -52,7 +52,7 @@
 #define HIST_ENTRY      2048
 #define LINE_HEIGHT     18
 #define TAB_HEIGHT      30
-#define TAB_WIDTH       170
+#define TAB_WIDTH       130
 #define WIN_W           860
 #define WIN_H           540
 #define SEP_LEN         52          /* length of the multiWatch dash rule */
@@ -253,11 +253,12 @@ extern Shared *g_sh[MAX_TABS];
 extern char    g_tab_cwd[MAX_TABS][PATH_MAX];
 
 /* ---- worker <-> GUI prompt markers ---- */
+#define NL_MARK        0x1e   /* in-pipe: a newline inside one command */
 #define PMARK_START 0x01
 #define PMARK_SEP   0x1f
 #define PMARK_END   0x02
 
-#define PROMPT_MAIN "het52@terminator> "
+#define PROMPT_MAIN "user@terminator> "
 #define PROMPT_CONT "> "
 
 /* ---- internal API ------------------------------------------------- */
