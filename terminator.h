@@ -257,7 +257,7 @@ extern char    g_tab_cwd[MAX_TABS][PATH_MAX];
 #define PMARK_SEP   0x1f
 #define PMARK_END   0x02
 
-#define PROMPT_MAIN "user@terminator> "
+#define PROMPT_MAIN "het52@terminator> "
 #define PROMPT_CONT "> "
 
 /* ---- internal API ------------------------------------------------- */
