@@ -197,31 +197,97 @@ void history_search(Tab *t, const char *term)
     tab_append_line(t, "No match for search term in history");
 }
 
-/* keystrokes while the "Enter search term: " prompt is open */
+/* ---------------- Ctrl+R: readline-style reverse search ---------------- */
+
+/* look backwards from `from` for a command containing the term */
+static void search_step(Tab *t, int from)
+{
+    int i;
+
+    if (from >= history_count())
+        from = history_count() - 1;
+
+    for (i = from; i >= 0; i--) {
+        char b[HIST_ENTRY];
+        if (!history_get(i, b, sizeof b))
+            continue;
+        if (t->search_len == 0 || strstr(b, t->search_buf)) {
+            snprintf(t->search_match, sizeof t->search_match, "%s", b);
+            t->search_pos = i;
+            t->search_failed = 0;
+            return;
+        }
+    }
+    t->search_failed = 1;          /* keep showing the last match */
+}
+
+/* Ctrl+R pressed: remember the line, start searching from the newest entry */
+static void search_begin(Tab *t)
+{
+    snprintf(t->search_orig, sizeof t->search_orig, "%s", t->input);
+    t->searching = 1;
+    t->search_len = 0;
+    t->search_buf[0] = '\0';
+    t->search_match[0] = '\0';
+    t->search_failed = 0;
+    t->search_pos = history_count() - 1;
+    search_step(t, t->search_pos);
+    t->dirty = 1;
+}
+
+/* put the match on the line and leave search mode */
+static void search_accept(Tab *t)
+{
+    snprintf(t->input, sizeof t->input, "%s", t->search_match);
+    t->len = (int)strlen(t->input);
+    t->cursor = t->len;
+    t->hist_pos = -1;
+    t->searching = 0;
+    t->dirty = 1;
+}
+
+/* leave search mode, restoring the line as it was before Ctrl+R */
+static void search_cancel(Tab *t)
+{
+    snprintf(t->input, sizeof t->input, "%s", t->search_orig);
+    t->len = (int)strlen(t->input);
+    t->cursor = t->len;
+    t->searching = 0;
+    t->dirty = 1;
+}
+
+/* keystrokes while the (reverse-i-search) prompt is open */
 static void gui_search_key(Tab *t, KeySym ks, int ctrl, int alt, char *text, int n)
 {
     if (ks == XK_Return || ks == XK_KP_Enter) {
-        char term[512], line[600];
-        snprintf(term, sizeof term, "%s", t->search_buf);
-        snprintf(line, sizeof line, "Enter search term: %s", term);
-        tab_append_line(t, line);
-        t->searching = 0;
-        t->search_buf[0] = '\0';
-        t->search_len = 0;
-        history_search(t, term);
+        search_accept(t);              /* accept and run it, as bash does */
+        if (t->len > 0)
+            gui_submit(t, g_active);
+        return;
+    }
+    if (ks == XK_Right || ks == XK_End) {
+        search_accept(t);              /* accept, leave it on the line */
+        return;
+    }
+    if (ks == XK_Escape || (ctrl && (ks == XK_g || ks == XK_c))) {
+        search_cancel(t);              /* abandon the search */
+        return;
+    }
+    if (ctrl && ks == XK_r) {          /* Ctrl+R again: next older match */
+        if (t->search_pos > 0)
+            search_step(t, t->search_pos - 1);
+        else
+            t->search_failed = 1;
         t->dirty = 1;
         return;
     }
     if (ks == XK_BackSpace || ks == XK_Delete) {
-        if (t->search_len > 0)
+        if (t->search_len > 0) {
             t->search_buf[--t->search_len] = '\0';
-        t->dirty = 1;
-        return;
-    }
-    if (ctrl && (ks == XK_c || ks == XK_g || ks == XK_r)) {
-        t->searching = 0;
-        t->search_buf[0] = '\0';
-        t->search_len = 0;
+            search_step(t, history_count() - 1);
+        } else {
+            search_cancel(t);
+        }
         t->dirty = 1;
         return;
     }
@@ -233,6 +299,7 @@ static void gui_search_key(Tab *t, KeySym ks, int ctrl, int alt, char *text, int
                 t->search_buf[t->search_len++] = (char)c;
         }
         t->search_buf[t->search_len] = '\0';
+        search_step(t, history_count() - 1);   /* re-search from the newest */
         t->dirty = 1;
     }
 }
@@ -272,10 +339,15 @@ static void gui_do_action(Action a, Tab *t, int idx)
     case ACT_PAGE_DOWN: g_tabs[g_active].scroll -= 5; if (g_tabs[g_active].scroll < 0) g_tabs[g_active].scroll = 0; break;
     case ACT_SUSPEND:   gui_suspend(t, idx); return;
     case ACT_SEARCH:
-        if (t->awaiting) {
-            t->searching = 1;
-            t->search_len = 0;
-            t->search_buf[0] = '\0';
+        if (!t->awaiting)
+            return;
+        if (!t->searching) {
+            search_begin(t);
+        } else if (t->search_pos > 0) {
+            search_step(t, t->search_pos - 1);   /* next older match */
+            t->dirty = 1;
+        } else {
+            t->search_failed = 1;
             t->dirty = 1;
         }
         return;

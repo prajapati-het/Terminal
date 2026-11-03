@@ -54,8 +54,22 @@ void gui_append_output(Tab *t, const char *data, int n, int idx)
 
         if (t->in_prompt) {
             if (c == PMARK_END) {
+                /* the worker sent the bare prompt; put the working directory
+                 * in it so it reads like a real terminal:
+                 *     user@terminator:~/Downloads> ls
+                 * The tab bar shows the same path in full. */
+                char sp[PATH_MAX], base[64];
+                size_t bn;
+
                 t->in_prompt = 0;
                 t->prompt[t->prompt_len] = '\0';
+
+                snprintf(base, sizeof base, "%s", PROMPT_MAIN);
+                bn = strlen(base);
+                while (bn > 0 && (base[bn - 1] == '>' || base[bn - 1] == ' '))
+                    base[--bn] = '\0';
+                short_path(g_tab_cwd[idx][0] ? g_tab_cwd[idx] : ".", sp, sizeof sp);
+                snprintf(t->prompt, sizeof t->prompt, "%s:%s> ", base, sp);
                 t->awaiting = 1;
             } else if (c == PMARK_SEP) {
                 t->prompt[t->prompt_len] = '\0';
@@ -105,7 +119,9 @@ static int input_line_at(Tab *t, int m, char *buf, int cap)
     int seg = 0, i = 0, len = 0;
 
     if (t->searching)
-        return snprintf(buf, cap, "Enter search term: %s", t->search_buf);
+        return snprintf(buf, cap, "(%sreverse-i-search)`%s': %s",
+                        t->search_failed ? "failed " : "",
+                        t->search_buf, t->search_match);
 
     while (seg < m) {
         while (i < t->len && t->input[i] != '\n') i++;
@@ -151,6 +167,21 @@ static int text_width(const char *s, int len)
     return len * g_cw;
 }
 
+/* The last component of a path -- what the tab bar shows. The full path is
+ * in the prompt, so the bar only needs enough to tell tabs apart. */
+static void dir_name(const char *cwd, char *out, int cap)
+{
+    const char *home = getenv("HOME");
+    const char *p;
+
+    if (!cwd || !*cwd) { snprintf(out, (size_t)cap, "."); return; }
+    if (home && *home && !strcmp(cwd, home)) { snprintf(out, (size_t)cap, "~"); return; }
+    if (!strcmp(cwd, "/")) { snprintf(out, (size_t)cap, "/"); return; }
+    p = strrchr(cwd, '/');
+    if (p && p[1]) snprintf(out, (size_t)cap, "%s", p + 1);
+    else snprintf(out, (size_t)cap, "%s", cwd);
+}
+
 void gui_draw(void)
 {
     XWindowAttributes attr;
@@ -171,12 +202,14 @@ void gui_draw(void)
     XSetForeground(g_dpy, g_gc, WhitePixel(g_dpy, g_scr));
     for (i = 0; i < g_tab_count; i++) {
         int x = i * TAB_WIDTH;
-        char label[PATH_MAX + 32];
-        char sp[PATH_MAX];
-        short_path(g_tab_cwd[i][0] ? g_tab_cwd[i] : ".", sp, sizeof sp);
-        snprintf(label, sizeof label, "[ %d: %s ]", i + 1, sp);
-        if ((int)strlen(label) > 14)
-            label[14] = '\0';
+        char label[PATH_MAX + 32], dn[PATH_MAX];
+        int maxch = (TAB_WIDTH - 12) / (g_cw > 0 ? g_cw : 8);
+
+        /* the directory's own name only -- the full path is in the prompt */
+        dir_name(g_tab_cwd[i][0] ? g_tab_cwd[i] : ".", dn, sizeof dn);
+        snprintf(label, sizeof label, "[ %d: %s ]", i + 1, dn);
+        if (maxch > 4 && (int)strlen(label) > maxch)
+            label[maxch] = '\0';
 
         if (i == g_active) {
             /* active tab: white block, black text */
@@ -251,11 +284,13 @@ void gui_draw(void)
         /* cursor */
         if (t->awaiting && t->scroll == 0) {
             const char *prompt_str;
-            char seg[MAX_CMD];
+            char seg[MAX_CMD], pre[80];
             int m = 0, segstart = 0, i2, sl = 0, cx, cy;
 
             if (t->searching) {
-                prompt_str = "Enter search term: ";
+                snprintf(pre, sizeof pre, "(%sreverse-i-search)`",
+                         t->search_failed ? "failed " : "");
+                prompt_str = pre;
                 snprintf(seg, sizeof seg, "%s", t->search_buf);
                 sl = (int)strlen(seg);
             } else {
@@ -970,3 +1005,5 @@ void gui_run(void)
         free(t->lines);
     }
 }
+
+

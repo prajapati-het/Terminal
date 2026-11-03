@@ -52,7 +52,7 @@
 #define HIST_ENTRY      2048
 #define LINE_HEIGHT     18
 #define TAB_HEIGHT      30
-#define TAB_WIDTH       110
+#define TAB_WIDTH       170
 #define WIN_W           860
 #define WIN_H           540
 #define SEP_LEN         52          /* length of the multiWatch dash rule */
@@ -152,7 +152,7 @@ typedef struct {
     /* prompt / input state (driven by the worker's prompt markers) */
     int    in_prompt;
     int    prompt_len;
-    char   prompt[256];
+    char   prompt[PATH_MAX + 96];   /* user@terminator:<cwd>> */
     int    awaiting;
     /* pipes */
     int    in_r, in_w, out_r, out_w, ctl_r, ctl_w;
@@ -165,9 +165,14 @@ typedef struct {
     int    sel_active;
     int    sel_l0, sel_c0, sel_l1, sel_c1;
     /* Ctrl+R search prompt */
-    int    searching;
-    char   search_buf[512];
-    int    search_len;
+    /* readline-style reverse-i-search (Ctrl+R) */
+    int    searching;                 /* search mode is active          */
+    int    search_len;                /* length of the search term      */
+    int    search_pos;                /* history index we last matched  */
+    int    search_failed;             /* no match for the current term  */
+    char   search_buf[512];           /* the term typed so far          */
+    char   search_orig[MAX_CMD];      /* the line as it was before Ctrl+R */
+    char   search_match[MAX_CMD];     /* the command we are showing     */
 } Tab;
 
 typedef enum {
@@ -343,4 +348,3 @@ void history_search(Tab *t, const char *term);
 
 
 #endif /* TERMINATOR_H */
-
