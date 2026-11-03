@@ -79,10 +79,32 @@ Terminator therefore keeps a **logical** working directory per worker
 not depend on the process's real directory. Every child `chdir()`s into
 `g_cwd` immediately before `exec`, so external commands still see the right
 directory. `pwd` prints `g_cwd`, and the worker sends `g_cwd` along with each
-prompt so the tab label can show it (`[ 1: ~/Downloads ]`). Long paths are
-shortened from the **left**, at component boundaries, so the part that changes
-stays visible: `cd /usr/share/doc` shows `[ 1: ..share/doc ]` rather than a
-common prefix that never moves.
+prompt so the display can show it. It appears **in the prompt itself**,
+bash-style, so every command is preceded by where it runs:
+
+```
+user@terminator:~/Downloads> ls
+```
+
+`$HOME` is shortened to `~`. The GUI composes this when it receives the prompt
+frame: the worker sends the bare prompt and the cwd separately, and the GUI
+rebuilds the prompt as `user@terminator:<cwd>> `. Because the echo of a
+submitted line uses the same string, the scrollback reads correctly too — each
+command sits under the directory it ran in.
+
+The tab bar shows the tab number plus the **name** of that tab's directory —
+just the last path component, not the whole path:
+
+```
+[ 1: cwtest ] [ 2: tmp ] [ + ]
+```
+
+`$HOME` shows as `~` and the root as `/`. `dir_name()` takes `strrchr(cwd, '/')`,
+so `/usr/share/doc` reads `doc`. That is enough to tell tabs apart at a glance
+while the exact path stays in the prompt, and it keeps the bar a fixed, calm
+width instead of stretching as you descend into deep directories. If a
+directory name is longer than the tab can hold, the label is clipped to fit
+(`(TAB_WIDTH - 12) / cell width` characters).
 
 Pathname globbing (`*`, `?`, `[`) is the one operation that cannot take a
 directory argument, so `glob_in_cwd()` performs it under a mutex, briefly
@@ -276,8 +298,9 @@ prompt+line in the scrollback and sends the raw line to the worker.
 * **Interrupts**: because Ctrl+C arrives as an X key event, the GUI signals the
   job's process group rather than relying on terminal signal delivery. This is
   what keeps "Ctrl+C in one tab does not touch another tab's jobs" true.
-* **Tab completion** (Task 10) has been removed at the user's request; Tab is
-  unbound and does nothing. Every other task is implemented.
+* **Tab completion (Task 10) is not implemented** — a deliberate scope
+  decision, argued in §10.1. Tab is left unbound: pressing it does nothing and
+  it never interferes with a running command. Every other task is implemented.
 * **`2>&1` and `<<` here-documents** are tokenised but not wired up; the brief
   requires `<`, `>`, `>>` and `2>`, which are all supported.
 * **Command substitution** runs through
@@ -289,6 +312,40 @@ prompt+line in the scrollback and sends the raw line to the worker.
   ignored (control and tab-switching hotkeys still work).
 * Output is handled at byte level (no UTF-8 glyph composition), and long lines
   are clipped rather than wrapped.
+
+### 10.1 Why Tab completion is not implemented
+
+This is a design decision, not an omission, and it rests on three arguments.
+
+**Completion belongs to the shell, and in this program the shell is not the
+GUI.** The architecture splits the two roles cleanly: the GUI owns the line
+being edited, and the worker owns the shell — variables, exit status, history
+and, crucially, the current directory. Filename completion needs the working
+directory. The GUI only ever learns it asynchronously, from the prompt frame
+the worker emits after each command, and that copy is stale in two situations:
+while a command is running, and whenever the directory changes without a new
+prompt. A completion routine reading that cached path would happily complete
+against the wrong directory. Implementing it correctly means adding a
+synchronous "what is your cwd?" round trip to the worker protocol — a new
+request/response path, with timeout and error handling, for a convenience
+feature. That is a large amount of protocol work to duplicate state the worker
+already owns.
+
+**A terminal that swallows Tab takes a key away from everything it runs.**
+In a real terminal the Tab character is input to whatever is in the foreground;
+that is precisely why terminals do not implement completion themselves and
+shells do. Keeping Tab unbound preserves the separation this project is built
+on — the emulator delivers bytes, the shell interprets them — instead of having
+the GUI impersonate the shell at the one moment the user might want a literal
+tab.
+
+**It carries no systems content.** Every other task in the brief maps onto a
+concept the course teaches: `fork`/`execvp`/`wait` (Task 2), `pipe`/`dup2`
+(Tasks 4 and 5), `poll` (Task 6), signals, `kill` and process groups (Task 8),
+and POSIX threads, semaphores and shared memory (the two execution modes and
+Task 9). Filename completion is `opendir`/`readdir` plus string comparison. With
+a fixed budget, effort went where the system-call surface is, and into the
+concurrency model that has to hold identically in thread mode and process mode.
 
 ## 11. Signals and job control
 
@@ -459,7 +516,7 @@ running a command in the switched tab, Ctrl+C interrupting a running `sleep`,
 closing the tab, a `ConfigureNotify` resize, and a clean shutdown, plus **Ctrl+Z** producing a `Stopped` line and the prompt back, **Ctrl+R**
 showing the newest match on entry, walking to the next older match on a second
 Ctrl+R, narrowing as characters are typed, cancelling on Esc, flagging a failed
-search, and running the match on Enter, and Tab being inert (Task 10 removed). All of this passes in **both thread mode and process mode**. That harness is what caught
+search, and running the match on Enter, and Tab being inert by design (§10.1). All of this passes in **both thread mode and process mode**. That harness is what caught
 the blocking-read hang; it is test-only and is not part of the shipped program.
 
 ## 16. Source layout
